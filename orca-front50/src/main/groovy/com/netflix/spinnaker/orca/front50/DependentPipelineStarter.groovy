@@ -96,19 +96,22 @@ class DependentPipelineStarter implements ApplicationContextAware {
       }
     }
 
+    def trigger = pipelineConfig.trigger
+    //keep the trigger as the preprocessor removes it.
+    def expectedArtifacts = pipelineConfig.expectedArtifacts
+
+    for (PipelinePreprocessor preprocessor : (pipelinePreprocessors ?: [])) {
+      pipelineConfig = preprocessor.process(pipelineConfig)
+    }
+
     if (parentPipelineStageId != null) {
       pipelineConfig.receivedArtifacts = artifactResolver?.getArtifacts(parentPipeline.stageById(parentPipelineStageId))
     } else {
       pipelineConfig.receivedArtifacts = artifactResolver?.getAllArtifacts(parentPipeline)
     }
 
-    def trigger = pipelineConfig.trigger
-    //keep the trigger as the preprocessor removes it.
-
-    for (PipelinePreprocessor preprocessor : (pipelinePreprocessors ?: [])) {
-      pipelineConfig = preprocessor.process(pipelineConfig)
-    }
     pipelineConfig.trigger = trigger
+    pipelineConfig.expectedArtifacts = expectedArtifacts
 
     def artifactError = null
     try {
@@ -119,7 +122,7 @@ class DependentPipelineStarter implements ApplicationContextAware {
 
     // Process the raw trigger to resolve any expressions before converting it to a Trigger object, which will not be
     // processed by the contextParameterProcessor (it only handles Maps, Lists, and Strings)
-    Map processedTrigger = contextParameterProcessor.process([trigger: pipelineConfig.trigger], [:], false).trigger
+    Map processedTrigger = contextParameterProcessor.process([trigger: pipelineConfig.trigger], [trigger: pipelineConfig.trigger], false).trigger
     pipelineConfig.trigger = objectMapper.readValue(objectMapper.writeValueAsString(processedTrigger), Trigger.class)
     if (parentPipeline.trigger.dryRun) {
       pipelineConfig.trigger.dryRun = true
@@ -144,7 +147,7 @@ class DependentPipelineStarter implements ApplicationContextAware {
 
         Id id = registry.createId("pipelines.triggered")
           .withTag("application", Optional.ofNullable(pipeline.getApplication()).orElse("null"))
-          .withTag("monitor", getClass().getSimpleName())
+          .withTag("monitor", "DependentPipelineStarter")
         registry.counter(id).increment()
 
       } as Callable<Void>, true, principal)

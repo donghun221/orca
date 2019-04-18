@@ -16,6 +16,7 @@
 
 package com.netflix.spinnaker.orca.pipeline;
 
+import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import com.netflix.spinnaker.orca.pipeline.TaskNode.TaskGraph;
 import com.netflix.spinnaker.orca.pipeline.graph.StageGraphBuilder;
 import com.netflix.spinnaker.orca.pipeline.model.Execution;
@@ -161,5 +162,28 @@ public interface StageDefinitionBuilder {
     }
     stage.setSyntheticStageOwner(stageOwner);
     return stage;
+  }
+
+  /**
+   * Return true if the stage can be manually skipped from the API.
+   */
+  default boolean canManuallySkip() {
+    return false;
+  }
+
+  default boolean isForceCacheRefreshEnabled(DynamicConfigService dynamicConfigService) {
+    String className = getClass().getSimpleName();
+
+    try {
+      return dynamicConfigService.isEnabled(
+        String.format(
+          "stages.%s.forceCacheRefresh",
+          Character.toLowerCase(className.charAt(0)) + className.substring(1)
+        ),
+        true
+      );
+    } catch (Exception e) {
+      return true;
+    }
   }
 }

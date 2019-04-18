@@ -21,6 +21,8 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableMap;
+import com.netflix.spectator.api.Id;
+import com.netflix.spinnaker.orca.RetryableTask;
 import com.netflix.spinnaker.orca.Task;
 import com.netflix.spinnaker.orca.TaskResult;
 import com.netflix.spinnaker.orca.clouddriver.CloudDriverCacheService;
@@ -30,11 +32,13 @@ import com.netflix.spinnaker.orca.pipeline.model.Stage;
 import lombok.Data;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import retrofit.client.Response;
 
 import java.io.IOException;
+import java.time.Clock;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -45,13 +49,15 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import com.netflix.spectator.api.Registry;
+
 import static com.netflix.spinnaker.orca.ExecutionStatus.RUNNING;
 import static com.netflix.spinnaker.orca.ExecutionStatus.SUCCEEDED;
 import static java.net.HttpURLConnection.HTTP_OK;
 
 @Component
 @Slf4j
-public class ManifestForceCacheRefreshTask extends AbstractCloudProviderAwareTask implements Task {
+public class ManifestForceCacheRefreshTask extends AbstractCloudProviderAwareTask implements Task, ManifestAware, RetryableTask {
   private final static String REFRESH_TYPE = "manifest";
   public final static String TASK_NAME = "forceCacheRefresh";
 
@@ -61,15 +67,32 @@ public class ManifestForceCacheRefreshTask extends AbstractCloudProviderAwareTas
   private final long timeout = TimeUnit.MINUTES.toMillis(15);
 
   private final long autoSucceedAfterMs = TimeUnit.MINUTES.toMillis(12);
+  private final Clock clock;
+  private final Registry registry;
+  private final CloudDriverCacheService cacheService;
+  private final CloudDriverCacheStatusService cacheStatusService;
+  private final ObjectMapper objectMapper;
+  private final Id durationTimerId;
 
   @Autowired
-  CloudDriverCacheService cacheService;
+  public ManifestForceCacheRefreshTask(Registry registry,
+                                       CloudDriverCacheService cacheService,
+                                       CloudDriverCacheStatusService cacheStatusService,
+                                       ObjectMapper objectMapper) {
+    this(registry, cacheService, cacheStatusService, objectMapper, Clock.systemUTC());
+  }
 
-  @Autowired
-  CloudDriverCacheStatusService cacheStatusService;
-
-  @Autowired
-  ObjectMapper objectMapper;
+  ManifestForceCacheRefreshTask(Registry registry,
+                                CloudDriverCacheService cacheService,
+                                CloudDriverCacheStatusService cacheStatusService,
+                                ObjectMapper objectMapper, Clock clock) {
+    this.registry = registry;
+    this.cacheService = cacheService;
+    this.cacheStatusService = cacheStatusService;
+    this.objectMapper = objectMapper;
+    this.clock = clock;
+    this.durationTimerId = registry.createId("manifestForceCacheRefreshTask.duration");
+  }
 
   @Override
   public TaskResult execute(Stage stage) {
@@ -77,19 +100,35 @@ public class ManifestForceCacheRefreshTask extends AbstractCloudProviderAwareTas
     if (startTime == null) {
       throw new IllegalStateException("Stage has no start time, cannot be executing.");
     }
-    if ((System.currentTimeMillis() - startTime) > autoSucceedAfterMs) {
+    long duration = clock.millis() - startTime;
+    if (duration > autoSucceedAfterMs) {
       log.info("{}: Force cache refresh never finished processing... assuming the cache is in sync and continuing...", stage.getExecution().getId());
+      registry.timer(durationTimerId.withTags("success", "true", "outcome", "autoSucceed"))
+        .record(duration, TimeUnit.MILLISECONDS);
       return new TaskResult(SUCCEEDED);
     }
 
     String cloudProvider = getCloudProvider(stage);
     String account = getCredentials(stage);
     StageData stageData = fromStage(stage);
+    stageData.manifestNamesByNamespace = manifestNamesByNamespace(stage);
 
     if (refreshManifests(cloudProvider, account, stageData)) {
+      registry.timer(durationTimerId.withTags("success", "true", "outcome", "complete"))
+        .record(duration, TimeUnit.MILLISECONDS);
       return new TaskResult(SUCCEEDED, toContext(stageData));
     } else {
-      return checkPendingRefreshes(cloudProvider, account, stageData, startTime);
+      TaskResult taskResult = checkPendingRefreshes(cloudProvider, account, stageData, startTime);
+
+      // ignoring any non-success, non-failure statuses
+      if (taskResult.getStatus().isSuccessful()) {
+        registry.timer(durationTimerId.withTags("success", "true", "outcome", "complete"))
+          .record(duration, TimeUnit.MILLISECONDS);
+      } else if (taskResult.getStatus().isFailure()) {
+        registry.timer(durationTimerId.withTags("success", "false", "outcome", "failure"))
+          .record(duration, TimeUnit.MILLISECONDS);
+      }
+      return taskResult;
     }
   }
 
@@ -116,13 +155,23 @@ public class ManifestForceCacheRefreshTask extends AbstractCloudProviderAwareTas
         Optional<PendingRefresh> pendingRefresh = pendingRefreshes.stream()
             .filter(pr -> pr.getDetails() != null)
             .filter(pr -> account.equals(pr.getDetails().getAccount()) &&
-                location.equals(pr.getDetails().getLocation()) &&
+                (location.equals(pr.getDetails().getLocation()) || StringUtils.isNotEmpty(location) && StringUtils.isEmpty(pr.getDetails().getLocation())) &&
                 name.equals(pr.getDetails().getName())
             )
             .findAny();
 
         if (pendingRefresh.isPresent()) {
-          if (!pendingRefreshProcessed(pendingRefresh.get(), refreshedManifests, startTime)) {
+          PendingRefresh refresh = pendingRefresh.get();
+          // it's possible the resource isn't supposed to have a namespace -- clouddriver reports this by removing it
+          // in the response. in this case, we make sure to set it to match between clouddriver and orca
+          if (StringUtils.isEmpty(refresh.getDetails().getLocation())) {
+            refresh.getDetails().setLocation(location);
+          }
+          if (pendingRefreshProcessed(refresh, refreshedManifests, startTime)) {
+            log.debug("Pending manifest refresh of {} in {} completed", id, account);
+            processedManifests.add(id);
+          } else {
+            log.debug("Pending manifest refresh of {} in {} still pending", id, account);
             allProcessed = false;
           }
         } else {
@@ -252,7 +301,6 @@ public class ManifestForceCacheRefreshTask extends AbstractCloudProviderAwareTas
 
   @Data
   static private class StageData {
-    @JsonProperty("outputs.manifestNamesByNamespace")
     Map<String, List<String>> manifestNamesByNamespace = new HashMap<>();
 
     @JsonProperty("refreshed.manifests")

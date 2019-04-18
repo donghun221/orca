@@ -15,19 +15,16 @@
  */
 package com.netflix.spinnaker.orca.pipeline.util
 
-import com.netflix.spinnaker.kork.artifacts.model.Artifact
-
-import java.util.regex.Pattern
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.netflix.spinnaker.orca.pipeline.model.JenkinsTrigger
-import com.netflix.spinnaker.orca.pipeline.model.PipelineTrigger
-import com.netflix.spinnaker.orca.pipeline.model.Stage
+import com.netflix.spinnaker.kork.artifacts.model.Artifact
+import com.netflix.spinnaker.orca.pipeline.model.*
 import com.netflix.spinnaker.orca.test.model.ExecutionBuilder
 import org.springframework.beans.factory.annotation.Autowired
 import spock.lang.Specification
 import spock.lang.Unroll
-import static com.netflix.spinnaker.orca.pipeline.model.JenkinsTrigger.BuildInfo
-import static com.netflix.spinnaker.orca.pipeline.model.JenkinsTrigger.JenkinsArtifact
+
+import java.util.regex.Pattern
+
 import static com.netflix.spinnaker.orca.pipeline.util.PackageType.DEB
 import static com.netflix.spinnaker.orca.pipeline.util.PackageType.RPM
 import static com.netflix.spinnaker.orca.test.model.ExecutionBuilder.pipeline
@@ -65,7 +62,7 @@ class PackageInfoSpec extends Specification {
     given:
     def execution = pipeline {
       trigger = new JenkinsTrigger("master", "job", 1, null)
-      trigger.buildInfo = new BuildInfo("name", 1, "http://jenkins", [new JenkinsArtifact("testFileName", ".")], [], false, "SUCCESS")
+      trigger.buildInfo = new JenkinsBuildInfo("name", 1, "http://jenkins", "SUCCESS", [new JenkinsArtifact("testFileName", ".")])
       stage {
         context = [buildInfo: [name: "someName"], package: "testPackageName"]
       }
@@ -201,18 +198,14 @@ class PackageInfoSpec extends Specification {
     where:
     filename                                       | requestPackage | packageType || result
     [["fileName": "package-4.11.4h-1.x86_64.rpm"]] | "package"      | RPM         || "package-4.11.4h-1.x86_64"
-//    [["fileName": "package-something-4.11.4h-1.x86_64.rpm"]]                                                 | "package"           | RPM         || "package"
-//    [["fileName": "package-4.11.4h-1.x86_64.rpm"], ["fileName": "package-something-4.11.4h-1.x86_64.rpm"]]   | "package"           | RPM         || "package-4.11.4h-1.x86_64"
-//    [["fileName": "package-something-4.11.4h-1.x86_64.rpm"], ["fileName": "package-4.11.4h-1.x86_64.rpm"]]   | "package"           | RPM         || "package-4.11.4h-1.x86_64"
-//    [["fileName": "package_4.11.4-h02.sha123_amd64.deb"]]                                                    | "package"           | DEB         || "package_4.11.4-h02.sha123_amd64"
-//    [["fileName": "package-something_4.11.4-h02.sha123_amd64.deb"]]                                          | "package"           | DEB         || "package"
-//    [["fileName": "package_4.11.4-h02.deb"], ["fileName": "package-something_4.11.4-h02.deb"]]               | "package"           | DEB         || "package_4.11.4-h02"
-//    [["fileName": "package_4.11.4-h02.sha123.deb"], ["fileName": "package-something_4.11.4-h02.deb"]]        | "package-something" | DEB         || "package-something_4.11.4-h02"
-//    [["fileName": "package_4.11.4-h02.sha123.deb"], ["fileName": "package-something_4.11.4-h02.sha123.deb"]] | "package"           | DEB         || "package_4.11.4-h02.sha123"
-//    [["fileName": "package.4.11.4-1+x86_64.nupkg"]]                                                          | "package"           | NUPKG       || "package.4.11.4-1+x86_64"
-//    [["fileName": "package-something.4.11.4-1+x86_64.nupkg"]]                                                | "package-something" | NUPKG       || "package-something.4.11.4-1+x86_64"
-//    [["fileName": "package.4.11.4-1+x86_64.nupkg"], ["fileName": "package-something.4.11.4-1+x86_64.nupkg"]] | "package-something" | NUPKG       || "package-something.4.11.4-1+x86_64"
-//    [["fileName": "package-something.4.11.4-1+x86_64.nupkg"], ["fileName": "package.4.11.4-1+x86_64.nupkg"]] | "package"           | NUPKG       || "package.4.11.4-1+x86_64"
+    [["fileName": "package-something-4.11.4h-1.x86_64.rpm"]]                                                 | "package"           | RPM         || "package"
+    [["fileName": "package-4.11.4h-1.x86_64.rpm"], ["fileName": "package-something-4.11.4h-1.x86_64.rpm"]]   | "package"           | RPM         || "package-4.11.4h-1.x86_64"
+    [["fileName": "package-something-4.11.4h-1.x86_64.rpm"], ["fileName": "package-4.11.4h-1.x86_64.rpm"]]   | "package"           | RPM         || "package-4.11.4h-1.x86_64"
+    [["fileName": "package_4.11.4-h02.sha123_amd64.deb"]]                                                    | "package"           | DEB         || "package_4.11.4-h02.sha123_amd64"
+    [["fileName": "package-something_4.11.4-h02.sha123_amd64.deb"]]                                          | "package"           | DEB         || "package"
+    [["fileName": "package_4.11.4-h02.deb"], ["fileName": "package-something_4.11.4-h02.deb"]]               | "package"           | DEB         || "package_4.11.4-h02"
+    [["fileName": "package_4.11.4-h02.sha123.deb"], ["fileName": "package-something_4.11.4-h02.deb"]]        | "package-something" | DEB         || "package-something_4.11.4-h02"
+    [["fileName": "package_4.11.4-h02.sha123.deb"], ["fileName": "package-something_4.11.4-h02.sha123.deb"]] | "package"           | DEB         || "package_4.11.4-h02.sha123"
   }
 
   def "findTargetPackage: bake execution with only a package set and jenkins stage artifacts"() {
@@ -399,7 +392,7 @@ class PackageInfoSpec extends Specification {
     given:
     def pipeline = pipeline {
       trigger = new JenkinsTrigger("master", "job", 1, null)
-      trigger.buildInfo = new BuildInfo("name", 1, "http://jenkins", [new JenkinsArtifact("api_1.1.1-h01.sha123_all.deb", ".")], [], false, "SUCCESS")
+      trigger.buildInfo = new JenkinsBuildInfo("name", 1, "http://jenkins", "SUCCESS", [new JenkinsArtifact("api_1.1.1-h01.sha123_all.deb", ".")])
       stage {
         refId = "1"
         context["package"] = "another_package"
@@ -435,7 +428,7 @@ class PackageInfoSpec extends Specification {
     given:
     def pipeline = pipeline {
       trigger = new JenkinsTrigger("master", "job", 1, null)
-      trigger.buildInfo = new BuildInfo("name", 1, "http://jenkins", [new JenkinsArtifact("api_2.2.2-h02.sha321_all.deb", ".")], [], false, "SUCCESS")
+      trigger.buildInfo = new JenkinsBuildInfo("name", 1, "http://jenkins", "SUCCESS", [new JenkinsArtifact("api_2.2.2-h02.sha321_all.deb", ".")])
       stage {
         context = [package: 'api']
       }
@@ -522,10 +515,10 @@ class PackageInfoSpec extends Specification {
     pipelineTrigger << [
       new PipelineTrigger(ExecutionBuilder.pipeline {
         trigger = new JenkinsTrigger("master", "job", 1, null)
-        trigger.buildInfo = new BuildInfo("name", 1, "http://jenkins", [new JenkinsArtifact("api_1.1.1-h01.sha123_all.deb", ".")], [], false, "SUCCESS")
+        trigger.buildInfo = new JenkinsBuildInfo("name", 1, "http://jenkins", "SUCCESS", [new JenkinsArtifact("api_1.1.1-h01.sha123_all.deb", ".")])
       }),
       new JenkinsTrigger("master", "job", 1, null).with {
-        it.buildInfo = new BuildInfo("name", 1, "http://jenkins", [new JenkinsArtifact("api_1.1.1-h01.sha123_all.deb", ".")], [], false, "SUCCESS")
+        it.buildInfo = new JenkinsBuildInfo("name", 1, "http://jenkins", "SUCCESS", [new JenkinsArtifact("api_1.1.1-h01.sha123_all.deb", ".")])
         it
       }
     ]
@@ -534,7 +527,7 @@ class PackageInfoSpec extends Specification {
   def "should fetch artifacts from upstream stage when not specified on pipeline trigger"() {
     given:
     def jenkinsTrigger = new JenkinsTrigger("master", "job", 1, "propertyFile")
-    jenkinsTrigger.buildInfo = new BuildInfo("name", 0, "url", [], [], false, "result")
+    jenkinsTrigger.buildInfo = new JenkinsBuildInfo("name", 0, "url", "result")
 
     def pipeline = pipeline {
       trigger = jenkinsTrigger    // has no artifacts!
@@ -744,5 +737,45 @@ class PackageInfoSpec extends Specification {
     where:
     triggerFilename                            | buildFilename                                | requestPackage     | result
     [["fileName": "test-package_1.0.0.deb"]]   | [["fileName": "test-package_1.0.0.deb"]]     | "test-package"     | "test-package_1.0.0"
+  }
+
+  def "should work if the same RPM artifact is present in different places"() {
+    given:
+    Stage bakeStage = new Stage()
+    PackageType packageType = RPM
+    boolean extractBuildDetails = false
+
+    Artifact artifact1 = new Artifact.ArtifactBuilder()
+            .type("rpm")
+            .name("test-package")
+            .version("1539516142-1.x86_64")
+            .reference("test-package-1539516142-1.x86_64.rpm")
+            .provenance("https://jenkins/test-package-build-master")
+            .build()
+    List<Artifact> artifacts = new ArrayList<>()
+    artifacts.add(artifact1)
+
+    PackageInfo packageInfo = new PackageInfo(bakeStage,
+            artifacts,
+            packageType.packageType,
+            packageType.versionDelimiter,
+            extractBuildDetails,
+            false,
+            mapper)
+    def allowMissingPackageInstallation = true
+
+    Map trigger = ["buildInfo": ["artifacts": triggerFilename], "artifacts": artifacts]
+    Map buildInfo = ["artifacts": buildFilename]
+    Map stageContext = ["package": requestPackage]
+
+    when:
+    Map returnedStageContext = packageInfo.createAugmentedRequest(trigger, buildInfo, stageContext, allowMissingPackageInstallation)
+
+    then:
+    returnedStageContext.package == result
+
+    where:
+    triggerFilename                            | buildFilename                                | requestPackage     | result
+    [["fileName": "test-package-1539516142-1.x86_64.rpm"]]   | [["fileName": "test-package-1539516142-1.x86_64.rpm"]]     | "test-package"     | "test-package-1539516142-1.x86_64"
   }
 }

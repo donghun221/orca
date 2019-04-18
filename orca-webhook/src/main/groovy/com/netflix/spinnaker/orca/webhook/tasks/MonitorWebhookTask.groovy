@@ -38,6 +38,7 @@ class MonitorWebhookTask implements OverridableTimeoutRetryableTask {
 
   long backoffPeriod = TimeUnit.SECONDS.toMillis(1)
   long timeout = TimeUnit.HOURS.toMillis(1)
+  private static final String JSON_PATH_NOT_FOUND_ERR_FMT = "Unable to parse %s: JSON property '%s' not found in response body"
 
   @Override
   long getDynamicBackoffPeriod(Stage stage, Duration taskDuration) {
@@ -79,12 +80,20 @@ class MonitorWebhookTask implements OverridableTimeoutRetryableTask {
         stage.execution.id,
         stage.id
       )
+    } catch (IllegalArgumentException e) {
+      if (e.cause instanceof UnknownHostException) {
+        log.warn("name resolution failure in webhook for pipeline ${stage.execution.id} to ${statusEndpoint}, will retry.", e)
+        return new TaskResult(ExecutionStatus.RUNNING)
+      }
+
+      throw e
     } catch (HttpStatusCodeException  e) {
       def statusCode = e.getStatusCode()
       if (statusCode.is5xxServerError() || statusCode.value() == 429) {
         log.warn("error getting webhook status from ${statusEndpoint}, will retry", e)
         return new TaskResult(ExecutionStatus.RUNNING)
       }
+
       throw e
     }
 
@@ -93,7 +102,8 @@ class MonitorWebhookTask implements OverridableTimeoutRetryableTask {
       webhook: [
         monitor: [
           body: response.body,
-          statusCode: response.statusCode
+          statusCode: response.statusCode,
+          statusCodeValue: response.statusCode.value()
         ]
       ],
       buildInfo: response.body, // TODO: deprecated
@@ -103,7 +113,7 @@ class MonitorWebhookTask implements OverridableTimeoutRetryableTask {
     try {
       result = JsonPath.read(response.body, statusJsonPath)
     } catch (PathNotFoundException e) {
-      responsePayload.webhook.monitor << [error: e.message]
+      responsePayload.webhook.monitor << [error: String.format(JSON_PATH_NOT_FOUND_ERR_FMT, "status", statusJsonPath)]
       return new TaskResult(ExecutionStatus.TERMINAL, responsePayload)
     }
     if (!(result instanceof String || result instanceof Number || result instanceof Boolean)) {
@@ -116,7 +126,7 @@ class MonitorWebhookTask implements OverridableTimeoutRetryableTask {
       try {
         progress = JsonPath.read(response.body, progressJsonPath)
       } catch (PathNotFoundException e) {
-        responsePayload.webhook.monitor << [error: e.message]
+        responsePayload.webhook.monitor << [error: String.format(JSON_PATH_NOT_FOUND_ERR_FMT, "progress", statusJsonPath)]
         return new TaskResult(ExecutionStatus.TERMINAL, responsePayload)
       }
       if (!(progress instanceof String)) {

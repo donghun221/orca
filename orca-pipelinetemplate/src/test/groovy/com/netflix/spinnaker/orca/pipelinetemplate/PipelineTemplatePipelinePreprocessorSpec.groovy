@@ -16,17 +16,19 @@
 package com.netflix.spinnaker.orca.pipelinetemplate
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.netflix.spectator.api.Clock
-import com.netflix.spectator.api.Counter
-import com.netflix.spectator.api.Id
-import com.netflix.spectator.api.Registry
-import com.netflix.spectator.api.Timer
+import com.netflix.spectator.api.*
+import com.netflix.spinnaker.orca.clouddriver.OortService
 import com.netflix.spinnaker.orca.front50.Front50Service
+import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository
+import com.netflix.spinnaker.orca.pipeline.util.ArtifactResolver
+import com.netflix.spinnaker.orca.pipeline.util.ContextParameterProcessor
 import com.netflix.spinnaker.orca.pipelinetemplate.handler.PipelineTemplateErrorHandler
 import com.netflix.spinnaker.orca.pipelinetemplate.handler.SchemaVersionHandler
 import com.netflix.spinnaker.orca.pipelinetemplate.loader.FileTemplateSchemeLoader
 import com.netflix.spinnaker.orca.pipelinetemplate.loader.TemplateLoader
+import com.netflix.spinnaker.orca.pipelinetemplate.loader.v2.V2TemplateLoader
 import com.netflix.spinnaker.orca.pipelinetemplate.v1schema.handler.V1SchemaHandlerGroup
+import com.netflix.spinnaker.orca.pipelinetemplate.v1schema.handler.v2.V2SchemaHandlerGroup
 import com.netflix.spinnaker.orca.pipelinetemplate.v1schema.model.StageDefinition
 import com.netflix.spinnaker.orca.pipelinetemplate.v1schema.render.JinjaRenderer
 import com.netflix.spinnaker.orca.pipelinetemplate.v1schema.render.Renderer
@@ -41,8 +43,14 @@ import static org.unitils.reflectionassert.ReflectionAssert.assertReflectionEqua
 class PipelineTemplatePipelinePreprocessorSpec extends Specification {
 
   ObjectMapper objectMapper = new ObjectMapper()
+  def oortService = Mock(OortService)
 
   TemplateLoader templateLoader = new TemplateLoader([new FileTemplateSchemeLoader(objectMapper)])
+  V2TemplateLoader v2TemplateLoader = new V2TemplateLoader(oortService, objectMapper)
+  ContextParameterProcessor contextParameterProcessor = new ContextParameterProcessor()
+
+  ExecutionRepository executionRepository = Mock(ExecutionRepository)
+  ArtifactResolver artifactResolver = Spy(ArtifactResolver, constructorArgs: [objectMapper, executionRepository, new ContextParameterProcessor()])
 
   Renderer renderer = new JinjaRenderer(
     new YamlRenderedValueConverter(), objectMapper, Mock(Front50Service), []
@@ -60,12 +68,9 @@ class PipelineTemplatePipelinePreprocessorSpec extends Specification {
   @Subject
   PipelineTemplatePreprocessor subject = new PipelineTemplatePreprocessor(
     objectMapper,
-    new SchemaVersionHandler(new V1SchemaHandlerGroup(
-      templateLoader,
-      renderer,
-      objectMapper,
-      registry
-    )),
+    new SchemaVersionHandler(
+      new V1SchemaHandlerGroup( templateLoader, renderer, objectMapper, registry),
+      new V2SchemaHandlerGroup(v2TemplateLoader, objectMapper, contextParameterProcessor, artifactResolver)),
     new PipelineTemplateErrorHandler(),
     registry
   )
@@ -120,6 +125,10 @@ class PipelineTemplatePipelinePreprocessorSpec extends Specification {
       keepWaitingPipelines: false,
       limitConcurrent: true,
       notifications: [],
+      source: [
+        id: source("simple-001.yml"),
+        type: "templatedPipeline"
+      ],
       stages: [
         [
           id: null,
@@ -335,7 +344,7 @@ class PipelineTemplatePipelinePreprocessorSpec extends Specification {
         pipeline: [
           application: 'myapp',
           template: [
-            source: getClass().getResource("/templates/${templatePath}").toURI()
+            source: source(templatePath)
           ],
           variables: variables
         ],
@@ -343,5 +352,9 @@ class PipelineTemplatePipelinePreprocessorSpec extends Specification {
       ],
       plan: plan
     ]
+  }
+
+  private String source(String templatePath) {
+    return getClass().getResource("/templates/${templatePath}").toURI()
   }
 }

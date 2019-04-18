@@ -16,14 +16,26 @@
 
 package com.netflix.spinnaker.orca.clouddriver.pipeline.cluster;
 
+import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.AbstractClusterWideClouddriverTask;
 import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.AbstractWaitForClusterWideClouddriverTask;
 import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.ScaleDownClusterTask;
 import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.WaitForScaleDownClusterTask;
+import com.netflix.spinnaker.orca.clouddriver.utils.TrafficGuard;
+import com.netflix.spinnaker.orca.locks.LockingConfigurationProperties;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 @Component
 public class ScaleDownClusterStage extends AbstractClusterWideClouddriverOperationStage {
+
+  @Autowired
+  public ScaleDownClusterStage(TrafficGuard trafficGuard,
+                               LockingConfigurationProperties lockingConfigurationProperties,
+                               DynamicConfigService dynamicConfigService) {
+    super(trafficGuard, lockingConfigurationProperties, dynamicConfigService);
+  }
+
   @Override
   protected Class<? extends AbstractClusterWideClouddriverTask> getClusterOperationTask() {
     return ScaleDownClusterTask.class;

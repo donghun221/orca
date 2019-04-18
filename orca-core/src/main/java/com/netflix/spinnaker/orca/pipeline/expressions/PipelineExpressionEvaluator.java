@@ -16,30 +16,42 @@
 
 package com.netflix.spinnaker.orca.pipeline.expressions;
 
-import java.util.*;
 import com.netflix.spinnaker.orca.pipeline.util.ContextFunctionConfiguration;
 import org.springframework.expression.ExpressionParser;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
+
+import java.util.Collection;
+import java.util.Map;
 
 public class PipelineExpressionEvaluator extends ExpressionsSupport implements ExpressionEvaluator {
   public static final String SUMMARY = "expressionEvaluationSummary";
   public static final String ERROR = "Failed Expression Evaluation";
 
   private final ExpressionParser parser = new SpelExpressionParser();
+  private final ContextFunctionConfiguration contextFunctionConfiguration;
 
   public interface ExpressionEvaluationVersion {
     String V2 = "v2";
   }
 
-  public PipelineExpressionEvaluator(final ContextFunctionConfiguration contextFunctionConfiguration) {
+  public PipelineExpressionEvaluator(ContextFunctionConfiguration contextFunctionConfiguration) {
     super(contextFunctionConfiguration);
+
+    this.contextFunctionConfiguration = contextFunctionConfiguration;
   }
 
   @Override
-  public Map<String, Object> evaluate(Map<String, Object> source, Object rootObject, ExpressionEvaluationSummary summary, boolean allowUnknownKeys) {
+  public Map<String, Object> evaluate(Map<String, Object> source,
+                                      Object rootObject,
+                                      ExpressionEvaluationSummary summary,
+                                      boolean allowUnknownKeys) {
     StandardEvaluationContext evaluationContext = newEvaluationContext(rootObject, allowUnknownKeys);
-    return new ExpressionTransform(parserContext, parser).transformMap(source, evaluationContext, summary);
+    return new ExpressionTransform(
+        contextFunctionConfiguration.getExpressionFunctionProviders(),
+        parserContext,
+        parser
+    ).transformMap(source, evaluationContext, summary);
   }
 }
 

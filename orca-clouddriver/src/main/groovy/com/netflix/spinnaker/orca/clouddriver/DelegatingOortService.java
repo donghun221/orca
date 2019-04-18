@@ -24,6 +24,7 @@ import retrofit.client.Response;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class DelegatingOortService
   extends DelegatingClouddriverService<OortService>
@@ -46,6 +47,11 @@ public class DelegatingOortService
   @Override
   public Manifest getManifest(String account, String location, String name) {
     return StringUtils.isEmpty(location) ? getService().getManifest(account, name) : getService().getManifest(account, location, name);
+  }
+
+  @Override
+  public Manifest getDynamicManifest(String account, String location, String kind, String app, String cluster, String criteria) {
+    return getService().getDynamicManifest(account, location, kind, app, cluster, criteria);
   }
 
   @Override
@@ -122,5 +128,15 @@ public class DelegatingOortService
   @Override
   public List<Map> getEntityTags(Map parameters) {
     return getService().getEntityTags(parameters);
+  }
+
+  @Override
+  public Map getCloudFormationStack(String stackId) {
+    return getService().getCloudFormationStack(stackId);
+  }
+
+  @Override
+  public Map getServiceInstance(String account, String cloudProvider, String region, String serviceInstanceName) {
+    return getService().getServiceInstance(account, cloudProvider, region, serviceInstanceName);
   }
 }

@@ -17,18 +17,17 @@
 package com.netflix.spinnaker.orca.igor.tasks
 
 import com.netflix.spinnaker.kork.core.RetrySupport
-
-import java.util.concurrent.TimeUnit
 import com.netflix.spinnaker.orca.ExecutionStatus
 import com.netflix.spinnaker.orca.OverridableTimeoutRetryableTask
 import com.netflix.spinnaker.orca.TaskResult
-import com.netflix.spinnaker.orca.igor.BuildArtifactFilter
 import com.netflix.spinnaker.orca.igor.BuildService
 import com.netflix.spinnaker.orca.pipeline.model.Stage
 import groovy.util.logging.Slf4j
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Component
 import retrofit.RetrofitError
+
+import java.util.concurrent.TimeUnit
 
 @Slf4j
 @Component
@@ -39,9 +38,6 @@ class MonitorJenkinsJobTask implements OverridableTimeoutRetryableTask {
 
   @Autowired
   BuildService buildService
-
-  @Autowired
-  BuildArtifactFilter buildArtifactFilter
 
   @Autowired
   RetrySupport retrySupport
@@ -72,26 +68,10 @@ class MonitorJenkinsJobTask implements OverridableTimeoutRetryableTask {
         return new TaskResult(ExecutionStatus.RUNNING, [buildInfo: build])
       }
 
-      if (build?.artifacts) {
-        build.artifacts = buildArtifactFilter.filterArtifacts(build.artifacts as List<Map>)
-      }
-
       outputs.buildInfo = build
 
       if (statusMap.containsKey(result)) {
         ExecutionStatus status = statusMap[result]
-
-        if (stage.context.propertyFile) {
-          Map<String, Object> properties = [:]
-          retrySupport.retry({
-            properties = buildService.getPropertyFile(buildNumber, stage.context.propertyFile, master, job)
-            if (properties.size() == 0 && result == 'SUCCESS') {
-              throw new IllegalStateException("Expected properties file ${stage.context.propertyFile} but it was either missing, empty or contained invalid syntax")
-            }
-          }, 6, 5000, false)
-          outputs << properties
-          outputs.propertyFileContents = properties
-        }
         if (result == 'UNSTABLE' && stage.context.markUnstableAsSuccessful) {
           status = ExecutionStatus.SUCCEEDED
         }

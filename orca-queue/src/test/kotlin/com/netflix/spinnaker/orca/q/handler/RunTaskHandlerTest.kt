@@ -44,7 +44,6 @@ import org.jetbrains.spek.api.dsl.on
 import org.jetbrains.spek.api.lifecycle.CachingMode.GROUP
 import org.jetbrains.spek.subject.SubjectSpek
 import org.threeten.extra.Minutes
-import java.lang.RuntimeException
 import java.time.Duration
 import kotlin.reflect.jvm.jvmName
 
@@ -1123,6 +1122,47 @@ object RunTaskHandlerTest : SubjectSpek<RunTaskHandler>({
       }
     }
 
+    describe("can reference non-existent trigger props") {
+      mapOf(
+        "\${trigger.type == 'manual'}" to true,
+        "\${trigger.buildNumber == null}" to true,
+        "\${trigger.quax ?: 'no quax'}" to "no quax"
+      ).forEach { expression, expected ->
+        given("an expression $expression in the stage context") {
+          val pipeline = pipeline {
+            stage {
+              refId = "1"
+              type = "whatever"
+              context["expr"] = expression
+              trigger = DefaultTrigger ("manual")
+              task {
+                id = "1"
+                startTime = clock.instant().toEpochMilli()
+              }
+            }
+          }
+          val message = RunTask(pipeline.type, pipeline.id, "foo", pipeline.stageByRef("1").id, "1", DummyTask::class.java)
+
+          beforeGroup {
+            whenever(task.execute(any())) doReturn TaskResult.SUCCEEDED
+            whenever(repository.retrieve(PIPELINE, message.executionId)) doReturn pipeline
+          }
+
+          afterGroup(::resetMocks)
+
+          action("the handler receives a message") {
+            subject.handle(message)
+          }
+
+          it("evaluates the expression") {
+            verify(task).execute(check {
+              assertThat(it.context["expr"]).isEqualTo(expected)
+            })
+          }
+        }
+      }
+    }
+
     given("a reference to deployedServerGroups in the stage context") {
       val pipeline = pipeline {
         stage {
@@ -1271,6 +1311,36 @@ object RunTaskHandlerTest : SubjectSpek<RunTaskHandler>({
 
     it("emits an error event") {
       verify(queue).push(isA<InvalidTaskType>())
+    }
+  }
+
+  describe("manual skip behavior") {
+    given("a stage with a manual skip flag") {
+      val pipeline = pipeline {
+        stage {
+          type = singleTaskStage.type
+          task {
+            id = "1"
+            implementingClass = DummyTask::class.jvmName
+          }
+          context["manualSkip"] = true
+        }
+      }
+      val message = RunTask(pipeline.type, pipeline.id, "foo", pipeline.stageByRef("1").id, "1", DummyTask::class.java)
+
+      beforeGroup {
+        whenever(repository.retrieve(PIPELINE, message.executionId)) doReturn pipeline
+      }
+
+      afterGroup(::resetMocks)
+
+      action("the handler receives a message") {
+        subject.handle(message)
+      }
+
+      it("sets the task's status to SKIPPED and completes the task") {
+        verify(queue).push(CompleteTask(message, SKIPPED))
+      }
     }
   }
 })

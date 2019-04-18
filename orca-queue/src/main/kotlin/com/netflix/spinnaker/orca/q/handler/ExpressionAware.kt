@@ -16,7 +16,11 @@
 
 package com.netflix.spinnaker.orca.q.handler
 
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.kotlin.convertValue
 import com.netflix.spinnaker.orca.exceptions.ExceptionHandler
+import com.netflix.spinnaker.orca.jackson.OrcaObjectMapper
+import com.netflix.spinnaker.orca.pipeline.expressions.ExpressionEvaluationSummary
 import com.netflix.spinnaker.orca.pipeline.expressions.PipelineExpressionEvaluator
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType.PIPELINE
@@ -32,11 +36,17 @@ import org.slf4j.LoggerFactory
 interface ExpressionAware {
 
   val contextParameterProcessor: ContextParameterProcessor
+
+  companion object {
+    val mapper: ObjectMapper = OrcaObjectMapper.newInstance()
+  }
+
   val log: Logger
     get() = LoggerFactory.getLogger(javaClass)
 
   fun Stage.withMergedContext(): Stage {
-    val processed = processEntries(this)
+    val evalSummary = ExpressionEvaluationSummary()
+    val processed = processEntries(this, evalSummary)
     val execution = execution
     this.context = object : MutableMap<String, Any?> by processed {
       override fun get(key: String): Any? {
@@ -60,12 +70,35 @@ interface ExpressionAware {
         return result
       }
     }
+
+    // Clean up errors: since expressions are evaluated multiple times, it's possible that when
+    // they were evaluated before the execution started not all data was available and the evaluation failed for
+    // some property. If that evaluation subsequently succeeds, make sure to remove past error messages from the
+    // context. Otherwise, it's very confusing in the UI because the value is clearly correctly evaluated but
+    // the error is still shown
+    if (hasFailedExpressions()) {
+      try {
+        val failedExpressions = this.context[PipelineExpressionEvaluator.SUMMARY] as MutableMap<String, *>
+
+        val keysToRemove: List<String> = failedExpressions.keys.filter { expressionKey ->
+          (evalSummary.wasAttempted(expressionKey) && !evalSummary.hasFailed(expressionKey))
+        }.toList()
+
+        keysToRemove.forEach { expressionKey ->
+          failedExpressions.remove(expressionKey)
+        }
+      } catch (e: Exception) {
+        // Best effort clean up, if if fails just log the error and leave the context be
+        log.error("Failed to remove stale expression errors", e)
+      }
+    }
+
     return this
   }
 
   fun Stage.includeExpressionEvaluationSummary() {
     when {
-      PipelineExpressionEvaluator.SUMMARY in this.context ->
+      hasFailedExpressions() ->
         try {
           val expressionEvaluationSummary = this.context[PipelineExpressionEvaluator.SUMMARY] as Map<*, *>
           val evaluationErrors: List<String> = expressionEvaluationSummary.values.flatMap { (it as List<*>).map { (it as Map<*, *>)["description"] as String } }
@@ -76,7 +109,9 @@ interface ExpressionAware {
     }
   }
 
-  fun Stage.hasFailedExpressions(): Boolean = PipelineExpressionEvaluator.SUMMARY in this.context
+  fun Stage.hasFailedExpressions(): Boolean =
+    (PipelineExpressionEvaluator.SUMMARY in this.context) &&
+    ((this.context[PipelineExpressionEvaluator.SUMMARY] as Map<*, *>).size > 0)
 
   fun Stage.shouldFailOnFailedExpressionEvaluation(): Boolean {
     return this.hasFailedExpressions() && this.context.containsKey("failOnFailedExpressions")
@@ -92,17 +127,22 @@ interface ExpressionAware {
       mapOf("details" to mapOf("errors" to mergedErrors))
     }
 
-  private fun processEntries(stage: Stage): StageContext =
+  private fun processEntries(stage: Stage, summary: ExpressionEvaluationSummary): StageContext =
     StageContext(stage, contextParameterProcessor.process(
       stage.context,
       (stage.context as StageContext).augmentContext(stage.execution),
-      true
+      true,
+      summary
     )
     )
 
+  // TODO (mvulfson): Ideally, we opt out of this method and use ContextParameterProcessor.buildExecutionContext
+  // but that doesn't generate StageContext preventing us from doing recursive lookups... An investigation for another day
   private fun StageContext.augmentContext(execution: Execution): StageContext =
     if (execution.type == PIPELINE) {
-      this + mapOf("trigger" to execution.trigger, "execution" to execution)
+      this + mapOf(
+        "trigger" to mapper.convertValue<Map<String, Any>>(execution.trigger),
+        "execution" to execution)
     } else {
       this
     }

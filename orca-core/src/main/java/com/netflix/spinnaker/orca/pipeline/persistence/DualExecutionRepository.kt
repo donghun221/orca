@@ -20,6 +20,7 @@ import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType.ORCHESTRATION
 import com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType.PIPELINE
 import com.netflix.spinnaker.orca.pipeline.model.Stage
+import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionComparator
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionCriteria
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
@@ -179,21 +180,45 @@ class DualExecutionRepository(
     )
   }
 
-  override fun retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(pipelineConfigIds: MutableList<String>,
-                                                                             buildTimeStartBoundary: Long,
-                                                                             buildTimeEndBoundary: Long): Observable<Execution> {
-    return Observable.merge(
-      primary.retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+  override fun retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+    pipelineConfigIds: MutableList<String>,
+    buildTimeStartBoundary: Long,
+    buildTimeEndBoundary: Long,
+    executionCriteria: ExecutionCriteria
+  ): List<Execution> {
+    return primary
+      .retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
         pipelineConfigIds,
         buildTimeStartBoundary,
-        buildTimeEndBoundary
-      ),
-      previous.retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
-        pipelineConfigIds,
-        buildTimeStartBoundary,
-        buildTimeEndBoundary
+        buildTimeEndBoundary,
+        executionCriteria
       )
-    )
+      .plus(previous.retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+        pipelineConfigIds,
+        buildTimeStartBoundary,
+        buildTimeEndBoundary,
+        executionCriteria)
+      )
+  }
+
+  override fun retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+    pipelineConfigIds: List<String>,
+    buildTimeStartBoundary: Long,
+    buildTimeEndBoundary: Long,
+    executionCriteria: ExecutionCriteria
+  ): List<Execution> {
+    return primary
+      .retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+        pipelineConfigIds,
+        buildTimeStartBoundary,
+        buildTimeEndBoundary,
+        executionCriteria
+      ).plus(previous.retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+        pipelineConfigIds,
+        buildTimeStartBoundary,
+        buildTimeEndBoundary,
+        executionCriteria)
+      )
   }
 
   override fun retrieveOrchestrationsForApplication(application: String,
@@ -204,11 +229,42 @@ class DualExecutionRepository(
     )
   }
 
+  override fun retrieveOrchestrationsForApplication(application: String,
+                                                    criteria: ExecutionCriteria,
+                                                    sorter: ExecutionComparator?): MutableList<Execution> {
+    val result = Observable.merge(
+      Observable.from(primary.retrieveOrchestrationsForApplication(application, criteria, sorter)),
+      Observable.from(previous.retrieveOrchestrationsForApplication(application, criteria, sorter))
+    ).toList().toBlocking().single().toMutableList()
+
+    return if (sorter != null) {
+      result.asSequence().sortedWith(sorter as Comparator<in Execution>).toMutableList()
+    } else {
+      result
+    }
+  }
+
+  override fun retrieveByCorrelationId(executionType: Execution.ExecutionType, correlationId: String): Execution {
+    return try {
+      primary.retrieveByCorrelationId(executionType, correlationId)
+    } catch (e: ExecutionNotFoundException) {
+      previous.retrieveByCorrelationId(executionType, correlationId)
+    }
+  }
+
   override fun retrieveOrchestrationForCorrelationId(correlationId: String): Execution {
     return try {
       primary.retrieveOrchestrationForCorrelationId(correlationId)
     } catch (e: ExecutionNotFoundException) {
       previous.retrieveOrchestrationForCorrelationId(correlationId)
+    }
+  }
+
+  override fun retrievePipelineForCorrelationId(correlationId: String): Execution {
+    return try {
+      primary.retrievePipelineForCorrelationId(correlationId)
+    } catch (e: ExecutionNotFoundException) {
+      previous.retrievePipelineForCorrelationId(correlationId)
     }
   }
 

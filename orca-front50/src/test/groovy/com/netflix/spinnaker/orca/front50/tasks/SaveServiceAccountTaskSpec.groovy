@@ -65,10 +65,40 @@ class SaveServiceAccountTaskSpec extends Specification {
     result.status == ExecutionStatus.SUCCEEDED
   }
 
+  def "should do nothing if roles are present and didn't change compared to the service user"() {
+    given:
+    def serviceAccount = 'pipeline-id@managed-service-account'
+    def pipeline = [
+      application   : 'orca',
+      name          : 'my pipeline',
+      id            : 'pipeline-id',
+      serviceAccount: serviceAccount,
+      stages        : [],
+      roles         : ['foo', 'bar']
+    ]
+    def stage = stage {
+      context = [
+        pipeline: Base64.encoder.encodeToString(objectMapper.writeValueAsString(pipeline).bytes)
+      ]
+    }
+
+    when:
+    def result = task.execute(stage)
+
+    then:
+    1 * fiatPermissionEvaluator.getPermission(serviceAccount) >> {
+      new UserPermission().addResources([new Role('foo'), new Role('bar')]).view
+    }
+    0 * front50Service.saveServiceAccount(_)
+    result.status == ExecutionStatus.SUCCEEDED
+    result.context == ImmutableMap.of('pipeline.serviceAccount', serviceAccount)
+  }
+
   def "should create a serviceAccount with correct roles"() {
     given:
     def pipeline = [
       application: 'orca',
+      id: 'pipeline-id',
       name: 'My pipeline',
       stages: [],
       roles: ['foo']
@@ -79,7 +109,7 @@ class SaveServiceAccountTaskSpec extends Specification {
       ]
     }
 
-    def expectedServiceAccount = new ServiceAccount(name: 'my-pipeline@managed-service-account', memberOf: ['foo'])
+    def expectedServiceAccount = new ServiceAccount(name: 'pipeline-id@managed-service-account', memberOf: ['foo'])
 
     when:
     stage.getExecution().setTrigger(new DefaultTrigger('manual', null, 'abc@somedomain.io'))
@@ -102,6 +132,7 @@ class SaveServiceAccountTaskSpec extends Specification {
     given:
     def pipeline = [
       application: 'orca',
+      id: 'pipeline-id',
       name: 'my pipeline',
       stages: [],
       roles: ['foo', 'bar']
@@ -127,4 +158,74 @@ class SaveServiceAccountTaskSpec extends Specification {
     result.context == ImmutableMap.of()
   }
 
+  def "should allow an admin to save pipelines"() {
+    given:
+    def pipeline = [
+      application: 'orca',
+      id: 'pipeline-id',
+      name: 'My pipeline',
+      stages: [],
+      roles: ['foo']
+    ]
+    def stage = stage {
+      context = [
+        pipeline: Base64.encoder.encodeToString(objectMapper.writeValueAsString(pipeline).bytes)
+      ]
+    }
+
+    def expectedServiceAccount = new ServiceAccount(name: 'pipeline-id@managed-service-account', memberOf: ['foo'])
+
+    when:
+    stage.getExecution().setTrigger(new DefaultTrigger('manual', null, 'abc@somedomain.io'))
+    def result = task.execute(stage)
+
+    then:
+    1 * fiatPermissionEvaluator.getPermission('abc@somedomain.io') >> {
+      new UserPermission().setAdmin(true).view
+    }
+
+    1 * front50Service.saveServiceAccount(expectedServiceAccount) >> {
+      new Response('http://front50', 200, 'OK', [], null)
+    }
+
+    result.status == ExecutionStatus.SUCCEEDED
+    result.context == ImmutableMap.of('pipeline.serviceAccount', expectedServiceAccount.name)
+  }
+
+  def "should generate a pipeline id if not already present"() {
+    given:
+    def pipeline = [
+      application: 'orca',
+      name: 'My pipeline',
+      stages: [],
+      roles: ['foo']
+    ]
+    def stage = stage {
+      context = [
+        pipeline: Base64.encoder.encodeToString(objectMapper.writeValueAsString(pipeline).bytes)
+      ]
+    }
+    def uuid = null
+    def expectedServiceAccountName = null
+
+    when:
+    stage.getExecution().setTrigger(new DefaultTrigger('manual', null, 'abc@somedomain.io'))
+    def result = task.execute(stage)
+
+    then:
+    1 * fiatPermissionEvaluator.getPermission('abc@somedomain.io') >> {
+      new UserPermission().addResources([new Role('foo')]).view
+    }
+
+    1 * front50Service.saveServiceAccount({ it.name != null }) >> { ServiceAccount serviceAccount ->
+      uuid = serviceAccount.name - "@managed-service-account"
+      expectedServiceAccountName = serviceAccount.name
+      new Response('http://front50', 200, 'OK', [], null)
+    }
+
+    result.status == ExecutionStatus.SUCCEEDED
+    result.context == ImmutableMap.of(
+      'pipeline.id', uuid,
+      'pipeline.serviceAccount', expectedServiceAccountName)
+  }
 }

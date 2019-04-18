@@ -109,7 +109,7 @@ class StartStageHandler(
           }
         }
       } else {
-        log.warn("Re-queuing $message as upstream stages are not yet complete")
+        log.info("Re-queuing $message as upstream stages are not yet complete")
         queue.push(message, retryDelay)
       }
     }
@@ -137,8 +137,11 @@ class StartStageHandler(
 
   private fun Stage.plan() {
     builder().let { builder ->
-      builder.buildTasks(this)
-      builder.buildBeforeStages(this) { it: Stage ->
+      //if we have a top level stage, ensure that context expressions are processed
+      val mergedStage = if (this.parentStageId == null) this.withMergedContext() else this
+      builder.addContextFlags(mergedStage)
+      builder.buildTasks(mergedStage)
+      builder.buildBeforeStages(mergedStage) { it: Stage ->
         repository.addStage(it.withMergedContext())
       }
     }

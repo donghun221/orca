@@ -16,10 +16,13 @@
 
 package com.netflix.spinnaker.orca.clouddriver.pipeline.cluster;
 
+import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService;
 import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.AbstractClusterWideClouddriverTask;
 import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.AbstractWaitForClusterWideClouddriverTask;
 import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.ShrinkClusterTask;
 import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.WaitForClusterShrinkTask;
+import com.netflix.spinnaker.orca.clouddriver.utils.TrafficGuard;
+import com.netflix.spinnaker.orca.locks.LockingConfigurationProperties;
 import com.netflix.spinnaker.orca.pipeline.graph.StageGraphBuilder;
 import com.netflix.spinnaker.orca.pipeline.model.Stage;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -38,7 +41,11 @@ public class ShrinkClusterStage extends AbstractClusterWideClouddriverOperationS
   private final DisableClusterStage disableClusterStage;
 
   @Autowired
-  public ShrinkClusterStage(DisableClusterStage disableClusterStage) {
+  public ShrinkClusterStage(TrafficGuard trafficGuard,
+                            LockingConfigurationProperties lockingConfigurationProperties,
+                            DynamicConfigService dynamicConfigService,
+                            DisableClusterStage disableClusterStage) {
+    super(trafficGuard, lockingConfigurationProperties, dynamicConfigService);
     this.disableClusterStage = disableClusterStage;
   }
 
@@ -53,7 +60,7 @@ public class ShrinkClusterStage extends AbstractClusterWideClouddriverOperationS
   }
 
   @Override
-  public void beforeStages(
+  public void addAdditionalBeforeStages(
     @Nonnull Stage parent,
     @Nonnull StageGraphBuilder graph
   ) {

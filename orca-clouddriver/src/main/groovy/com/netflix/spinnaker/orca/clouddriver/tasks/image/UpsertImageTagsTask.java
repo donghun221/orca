@@ -16,9 +16,8 @@
 
 package com.netflix.spinnaker.orca.clouddriver.tasks.image;
 
-import java.util.List;
-import java.util.concurrent.TimeUnit;
 import com.google.common.collect.ImmutableMap;
+import com.netflix.spinnaker.kork.core.RetrySupport;
 import com.netflix.spinnaker.orca.ExecutionStatus;
 import com.netflix.spinnaker.orca.RetryableTask;
 import com.netflix.spinnaker.orca.TaskResult;
@@ -29,7 +28,14 @@ import com.netflix.spinnaker.orca.pipeline.model.Stage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import retrofit.RetrofitError;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class UpsertImageTagsTask extends AbstractCloudProviderAwareTask implements RetryableTask {
@@ -41,6 +47,12 @@ public class UpsertImageTagsTask extends AbstractCloudProviderAwareTask implemen
   @Autowired
   List<ImageTagger> imageTaggers;
 
+  @Autowired
+  RetrySupport retrySupport;
+
+  @Value("${tasks.upsertImageTagsTimeoutMillis:600000}")
+  private Long upsertImageTagsTimeoutMillis;
+
   @Override
   public TaskResult execute(Stage stage) {
     String cloudProvider = getCloudProvider(stage);
@@ -50,9 +62,15 @@ public class UpsertImageTagsTask extends AbstractCloudProviderAwareTask implemen
       .findFirst()
       .orElseThrow(() -> new IllegalStateException("ImageTagger not found for cloudProvider " + cloudProvider));
 
+    List<Map<String, Map>> operations = new ArrayList<>();
+
     try {
       ImageTagger.OperationContext result = tagger.getOperationContext(stage);
-      TaskId taskId = kato.requestOperations(cloudProvider, result.operations).toBlocking().first();
+      operations.addAll(result.operations);
+
+      TaskId taskId = retrySupport.retry(() ->
+          kato.requestOperations(cloudProvider, result.operations).toBlocking().first(),
+        10, 5, false);
 
       return new TaskResult(ExecutionStatus.SUCCEEDED, ImmutableMap.<String, Object>builder()
         .put("notification.type", "upsertimagetags")
@@ -67,6 +85,15 @@ public class UpsertImageTagsTask extends AbstractCloudProviderAwareTask implemen
       }
 
       throw e;
+    } catch (RetrofitError e) {
+      log.error(
+        "Failed creating clouddriver upsertimagetags task, cloudprovider: {}, operations: {}",
+        cloudProvider,
+        operations.isEmpty() ? "not found" : operations,
+        e
+      );
+
+      throw e;
     }
   }
 
@@ -77,6 +104,6 @@ public class UpsertImageTagsTask extends AbstractCloudProviderAwareTask implemen
 
   @Override
   public long getTimeout() {
-    return TimeUnit.MINUTES.toMillis(10);
+    return upsertImageTagsTimeoutMillis;
   }
 }

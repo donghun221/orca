@@ -18,6 +18,7 @@ package com.netflix.spinnaker.orca.clouddriver.utils
 
 import com.netflix.spectator.api.NoopRegistry
 import com.netflix.spectator.api.Registry
+import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService
 import com.netflix.spinnaker.moniker.Moniker
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.Location
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.Location.Type
@@ -34,43 +35,54 @@ import spock.lang.Unroll
 class TrafficGuardSpec extends Specification {
 
   OortHelper oortHelper = Mock(OortHelper)
-
   Front50Service front50Service = Mock(Front50Service)
-
   Registry registry = new NoopRegistry()
+  DynamicConfigService dynamicConfigService = Mock(DynamicConfigService)
 
   Application application = Stub(Application) {
     details() >> applicationDetails
   }
 
-  Map otherServerGroup
-  Map targetServerGroup
-  Location location
-  Moniker moniker
-
-  @Shared
-  Map<String, Object> applicationDetails = [:]
+  @Shared Location location = new Location(Type.REGION, "us-east-1")
+  @Shared Moniker moniker = new Moniker(app: "app", stack: "foo", cluster: "app-foo")
+  @Shared String targetName = "app-foo-v001"
+  @Shared String otherName = "app-foo-v000"
+  @Shared Map<String, Object> applicationDetails = [:]
 
   @Subject
-  TrafficGuard trafficGuard = new TrafficGuard(oortHelper, new Optional<>(front50Service), registry)
+  TrafficGuard trafficGuard = new TrafficGuard(oortHelper, new Optional<>(front50Service), registry, dynamicConfigService)
 
   void setup() {
-    targetServerGroup = [
-      account: "test",
-      region : "us-east-1",
-      name   : "app-foo-v001",
-      moniker: [app: "app", stack: "foo", sequence: 1, cluster: "app-foo"]
-    ]
-    otherServerGroup = [
-      account   : "test",
-      region    : "us-east-1",
-      name      : "app-foo-v000",
-      moniker   : [app: "app", stack: "foo", sequence: 0, cluster: "app-foo"],
-      isDisabled: true
-    ]
-    location = new Location(Type.REGION, "us-east-1")
-    moniker = new Moniker(app: "app", stack: "foo", cluster: "app-foo")
     applicationDetails.clear()
+  }
+
+  def makeServerGroup(String name, int up, int down = 0, Map overrides = [:]) {
+    return [
+        account: 'test',
+        region: 'us-east-1',
+        name: name,
+        moniker: MonikerHelper.friggaToMoniker(name),
+        isDisabled: false,
+        instances: [[healthState: 'Up']] * up + [[healthState: 'OutOfService']] * down
+    ] + overrides
+  }
+
+  void "should ignore disabled traffic guards"() {
+    given:
+    addGuard([account: "test", location: "us-east-1", stack: "foo", enabled: false])
+
+    when:
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
+
+    then:
+    notThrown(TrafficGuardException)
+    1 * front50Service.get("app") >> application
+    1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
+      serverGroups: [
+        makeServerGroup(targetName, 1),
+        makeServerGroup(otherName, 0, 1, [isDisabled: true])
+      ]
+    ]
   }
 
   void "should throw exception when target server group is the only one enabled in cluster"() {
@@ -78,14 +90,155 @@ class TrafficGuardSpec extends Specification {
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
 
     when:
-    trafficGuard.verifyTrafficRemoval("app-foo-v001", moniker, "test", location, "aws", "x")
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
+
+    then:
+    def e = thrown(TrafficGuardException)
+    e.message.startsWith("This cluster ('app-foo' in test/us-east-1) has traffic guards enabled.")
+    1 * front50Service.get("app") >> application
+    1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
+      serverGroups: [
+        makeServerGroup(targetName, 1),
+        makeServerGroup(otherName, 0, 1, [isDisabled: true])
+      ]
+    ]
+  }
+
+  void "should throw exception when target server group can not be found in cluster"() {
+    given:
+    addGuard([account: "test", location: "us-east-1", stack: "foo"])
+
+    when:
+    trafficGuard.verifyTrafficRemoval("app-foo-v999", MonikerHelper.friggaToMoniker("app-foo-v999"), "test", location, "aws", "x")
+
+    then:
+    def e = thrown(TrafficGuardException)
+    e.message.startsWith("Could not find server group 'app-foo-v999'")
+    1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
+      serverGroups: [
+        makeServerGroup(targetName, 1),
+        makeServerGroup(otherName, 0, 1, [isDisabled: true])
+      ]
+    ]
+  }
+
+  void "should be able to handle a server group in a namespace"() {
+    when:
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
+
+    then:
+    notThrown(TrafficGuardException)
+    1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
+      serverGroups: [
+        makeServerGroup(targetName, 2, 0, [namespace: 'us-east-1']),
+        makeServerGroup(otherName, 1, 0, [namespace: 'us-east-1'])
+      ]
+    ]
+
+  }
+
+  void "should throw exception when capacity ratio less than configured minimum"() {
+    given:
+    addGuard([account: "test", location: "us-east-1", stack: "foo"])
+
+    when:
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
 
     then:
     thrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup, otherServerGroup]
+      serverGroups: [
+        makeServerGroup(targetName, 2),
+        makeServerGroup(otherName, 1)
+      ]
     ]
+
+    // configure a minimum desired ratio of 40%, which means going from 3 to 1 instances (33%) is not ok
+    1 * dynamicConfigService.getConfig(Double.class, TrafficGuard.MIN_CAPACITY_RATIO, 0d) >> 0.4d
+  }
+
+  void "should not throw exception when capacity ratio more than configured minimum"() {
+    given:
+    addGuard([account: "test", location: "us-east-1", stack: "foo"])
+
+    when:
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
+
+    then:
+    notThrown(TrafficGuardException)
+    1 * front50Service.get("app") >> application
+    1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
+      serverGroups: [
+        makeServerGroup(targetName, 2),
+        makeServerGroup(otherName, 1)
+      ]
+    ]
+
+    // configure a minimum desired ratio of 25%, which means going from 3 to 1 instances (33%) is ok
+    1 * dynamicConfigService.getConfig(Double.class, TrafficGuard.MIN_CAPACITY_RATIO, 0d) >> 0.25d
+  }
+
+  void "should throw exception when disabling multiple server groups leads to reduced capacity"() {
+    given:
+    addGuard([account: "test", location: "us-east-1", stack: "foo"])
+
+    // simulate the case where we have a main server group with 100 instances and a debugging one with 1 instance
+    // then a red/black operation can lead to the newest (small) one being cloned and everything else disabled
+    List<TargetServerGroup> serverGroupsGoingAway =
+      [makeServerGroup("app-foo-v000", 100) as TargetServerGroup,
+       makeServerGroup("app-foo-v001", 1) as TargetServerGroup]
+
+    when:
+    trafficGuard.verifyTrafficRemoval(
+      serverGroupsGoingAway,
+      serverGroupsGoingAway + [makeServerGroup("app-foo-v002", 1) as TargetServerGroup],
+      "test", "x")
+
+    then:
+    thrown(TrafficGuardException)
+    1 * front50Service.get("app") >> application
+    1 * dynamicConfigService.getConfig(Double.class, TrafficGuard.MIN_CAPACITY_RATIO, 0d) >> 0.40d
+  }
+
+  void "should not throw exception during a regular shrink/disable cluster-wide operation"() {
+    given:
+    addGuard([account: "test", location: "us-east-1", stack: "foo"])
+
+    // simulate the case where we have a main server group with 100 instances and a debugging one with 1 instance
+    // then a red/black operation can lead to the newest (small) one being cloned and everything else disabled
+    List<TargetServerGroup> serverGroupsGoingAway =
+      [makeServerGroup("app-foo-v000", 0, 100) as TargetServerGroup,
+       makeServerGroup("app-foo-v001", 100, 0) as TargetServerGroup]
+
+    when:
+    trafficGuard.verifyTrafficRemoval(
+      serverGroupsGoingAway,
+      serverGroupsGoingAway + [makeServerGroup("app-foo-v002", 100) as TargetServerGroup],
+      "test", "x")
+
+    then:
+    notThrown(TrafficGuardException)
+    1 * front50Service.get("app") >> application
+    1 * dynamicConfigService.getConfig(Double.class, TrafficGuard.MIN_CAPACITY_RATIO, 0d) >> 0.40d
+  }
+
+  void "should be able to destroy multiple empty or disabled server groups as one operation"() {
+    given:
+    addGuard([account: "test", location: "us-east-1", stack: "foo"])
+    List<TargetServerGroup> serverGroupsGoingAway =
+      [makeServerGroup("app-foo-v000", 0) as TargetServerGroup,
+       makeServerGroup("app-foo-v001", 0, 3) as TargetServerGroup]
+
+    when:
+    trafficGuard.verifyTrafficRemoval(
+      serverGroupsGoingAway,
+      serverGroupsGoingAway,
+      "test", "x")
+
+    then:
+    notThrown(TrafficGuardException)
+    1 * front50Service.get("app") >> application
   }
 
   void "should throw exception when target server group is the only one in cluster"() {
@@ -93,30 +246,45 @@ class TrafficGuardSpec extends Specification {
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
 
     when:
-    trafficGuard.verifyTrafficRemoval("app-foo-v001", moniker, "test", location, "aws", "x")
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
 
     then:
     thrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup]
+      serverGroups: [makeServerGroup(targetName, 1)]
     ]
   }
 
   void "should validate location when looking for other enabled server groups in cluster"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    otherServerGroup.isDisabled = false
-    otherServerGroup.region = "us-west-1"
 
     when:
-    trafficGuard.verifyTrafficRemoval("app-foo-v001", moniker, "test", location, "aws", "x")
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
 
     then:
     thrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup, otherServerGroup]
+      serverGroups: [
+        makeServerGroup(targetName, 1),
+        makeServerGroup(otherName, 1, 0, [region: 'us-west-1'])]
+    ]
+  }
+
+  void "should not throw exception when cluster has no active instances"() {
+    given:
+    addGuard([account: "test", location: "us-east-1", stack: "foo"])
+
+    when:
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
+
+    then:
+    noExceptionThrown()
+    1 * front50Service.get("app") >> application
+    1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
+      serverGroups: [makeServerGroup(targetName, 0, 1)]
     ]
   }
 
@@ -125,45 +293,47 @@ class TrafficGuardSpec extends Specification {
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
 
     when:
-    trafficGuard.verifyTrafficRemoval("app-foo-v001", moniker, "test", location, "aws", "x")
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
 
     then:
-    thrown(TrafficGuardException)
-    1 * front50Service.get("app") >> application
+    def e = thrown(TrafficGuardException)
+    e.message.startsWith('Could not find cluster')
+//    (the front50 check has moved after the cluster check)
+//    1 * front50Service.get("app") >> application
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> Optional.empty()
   }
 
   void "should not throw if another server group is enabled and has instances"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    otherServerGroup.isDisabled = false
-    otherServerGroup.instances = [[id: 'a', healthState: 'Up']]
 
     when:
-    trafficGuard.verifyTrafficRemoval("app-foo-v001", moniker, "test", location, "aws", "x")
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
 
     then:
     notThrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup, otherServerGroup]
+      serverGroups: [
+        makeServerGroup(targetName, 1),
+        makeServerGroup(otherName, 1)]
     ]
   }
 
-  void "should throw if another server group is enabled but no instances are 'up'"() {
+  void "should throw if another server group is enabled but no instances are 'Up'"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    otherServerGroup.isDisabled = false
-    otherServerGroup.instances = [[id: 'a', healthState: 'OutOfService']]
 
     when:
-    trafficGuard.verifyTrafficRemoval("app-foo-v001", moniker, "test", location, "aws", "x")
+    trafficGuard.verifyTrafficRemoval(targetName, moniker, "test", location, "aws", "x")
 
     then:
     thrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup, otherServerGroup]
+      serverGroups: [
+        makeServerGroup(targetName, 1),
+        makeServerGroup(otherName, 0, 1)]
     ]
   }
 
@@ -239,7 +409,8 @@ class TrafficGuardSpec extends Specification {
   void "instance termination should fail when last healthy instance in only server group in cluster"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    targetServerGroup.instances = [[name: "i-1", healthState: "Up"], [name: "i-2", healthState: "Down"]]
+    def targetServerGroup = makeServerGroup(targetName, 0, 0,
+      [instances: [[name: "i-1", healthState: "Up"], [name: "i-2", healthState: "Down"]]])
 
     when:
     trafficGuard.verifyInstanceTermination(null, moniker, ["i-1"], "test", location, "aws", "x")
@@ -247,18 +418,17 @@ class TrafficGuardSpec extends Specification {
     then:
     thrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
-    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >> [[results: [[account: "test", region: location.value, serverGroup: "app-foo-v001"]]]]
-    1 * oortHelper.getTargetServerGroup("test", "app-foo-v001", location.value, "aws") >> (targetServerGroup as TargetServerGroup)
-    1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup]
-    ]
+    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >>
+      [[results: [[account: "test", region: location.value, serverGroup: targetName]]]]
+    1 * oortHelper.getTargetServerGroup("test", targetName, location.value, "aws") >> (targetServerGroup as TargetServerGroup)
+    1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >>
+      [serverGroups: [targetServerGroup]]
   }
 
   void "instance termination should fail when last healthy instance in only active server group in cluster"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    targetServerGroup.instances = [[name: "i-1", healthState: "Up"], [name: "i-2", healthState: "Down"]]
-    otherServerGroup.instances = [[name: "i-1", healthState: "Down"]]
+    def targetServerGroup = makeServerGroup(targetName, 0, 0, [instances: [[name: "i-1", healthState: "Up"], [name: "i-2", healthState: "Down"]]])
 
     when:
     trafficGuard.verifyInstanceTermination(null, MonikerHelper.friggaToMoniker(null), ["i-1"], "test", location, "aws", "x")
@@ -266,18 +436,21 @@ class TrafficGuardSpec extends Specification {
     then:
     thrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
-    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >> [[results: [[account: "test", region: location.value, serverGroup: "app-foo-v001"]]]]
-    1 * oortHelper.getTargetServerGroup("test", "app-foo-v001", location.value, "aws") >> (targetServerGroup as TargetServerGroup)
+    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >>
+      [[results: [[account: "test", region: location.value, serverGroup: targetName]]]]
+    1 * oortHelper.getTargetServerGroup("test", targetName, location.value, "aws") >> (targetServerGroup as TargetServerGroup)
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup, otherServerGroup]
+      serverGroups: [
+        targetServerGroup,
+        makeServerGroup(otherName, 0, 1)
+      ]
     ]
   }
 
   void "instance termination should succeed when other server group in cluster contains healthy instance"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    targetServerGroup.instances = [[name: "i-1", healthState: "Up"], [name: "i-2", healthState: "Down"]]
-    otherServerGroup.instances = [[name: "i-1", healthState: "Up"]]
+    def targetServerGroup = makeServerGroup(targetName, 0, 0, [instances: [[name: "i-1", healthState: "Up"], [name: "i-2", healthState: "Down"]]])
 
     when:
     trafficGuard.verifyInstanceTermination(null, moniker, ["i-1"], "test", location, "aws", "x")
@@ -285,18 +458,21 @@ class TrafficGuardSpec extends Specification {
     then:
     notThrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
-    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >> [[results: [[account: "test", region: location.value, serverGroup: "app-foo-v001"]]]]
-    1 * oortHelper.getTargetServerGroup("test", "app-foo-v001", location.value, "aws") >> (targetServerGroup as TargetServerGroup)
+    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >>
+      [[results: [[account: "test", region: location.value, serverGroup: targetName]]]]
+    1 * oortHelper.getTargetServerGroup("test", targetName, location.value, "aws") >> (targetServerGroup as TargetServerGroup)
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup, otherServerGroup]
+      serverGroups: [
+        targetServerGroup,
+        makeServerGroup(otherName, 1, 0)
+      ]
     ]
   }
 
   void "instance termination should fail when trying to terminate all up instances in the cluster"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    targetServerGroup.instances = [[name: "i-1", healthState: "Up"], [name: "i-2", healthState: "Up"]]
-    otherServerGroup.instances = [[name: "i-1", healthState: "Down"]]
+    def targetServerGroup = makeServerGroup(targetName, 0, 0, [instances: [[name: "i-1", healthState: "Up"], [name: "i-2", healthState: "Up"]]])
 
     when:
     trafficGuard.verifyInstanceTermination(null, moniker, ["i-1", "i-2"], "test", location, "aws", "x")
@@ -304,48 +480,56 @@ class TrafficGuardSpec extends Specification {
     then:
     thrown(TrafficGuardException)
     1 * front50Service.get("app") >> application
-    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >> [[results: [[account: "test", region: location.value, serverGroup: "app-foo-v001"]]]]
-    1 * oortHelper.getSearchResults("i-2", "instances", "aws") >> [[results: [[account: "test", region: location.value, serverGroup: "app-foo-v001"]]]]
-    1 * oortHelper.getTargetServerGroup("test", "app-foo-v001", location.value, "aws") >> (targetServerGroup as TargetServerGroup)
+    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >> [[results: [[account: "test", region: location.value, serverGroup: targetName]]]]
+    1 * oortHelper.getSearchResults("i-2", "instances", "aws") >> [[results: [[account: "test", region: location.value, serverGroup: targetName]]]]
+    1 * oortHelper.getTargetServerGroup("test", targetName, location.value, "aws") >> (targetServerGroup as TargetServerGroup)
     1 * oortHelper.getCluster("app", "test", "app-foo", "aws") >> [
-      serverGroups: [targetServerGroup, otherServerGroup]
+      serverGroups: [
+        targetServerGroup,
+        makeServerGroup(otherName, 0, 1)
+      ]
     ]
   }
 
   void "instance termination should succeed when instance is not up, regardless of other instances"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    targetServerGroup.instances = [[name: "i-1"]]
 
     when:
     trafficGuard.verifyInstanceTermination(null, moniker, ["i-1"], "test", location, "aws", "x")
 
     then:
     notThrown(TrafficGuardException)
-    1 * front50Service.get("app") >> application
-    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >> [[results: [[account: "test", region: location.value, serverGroup: "app-foo-v001"]]]]
-    1 * oortHelper.getTargetServerGroup("test", "app-foo-v001", location.value, "aws") >> (targetServerGroup as TargetServerGroup)
+    0 * front50Service.get("app") >> application
+    1 * oortHelper.getSearchResults("i-1", "instances", "aws") >>
+      [[results: [[account: "test", region: location.value, serverGroup: targetName]]]]
+    1 * oortHelper.getTargetServerGroup("test", targetName, location.value, "aws") >>
+      (makeServerGroup(targetName, 0, 0, [instances: [[name: "i-1"]]]) as TargetServerGroup)
     0 * _
   }
 
   void "should avoid searching for instance ids when server group provided"() {
     given:
     addGuard([account: "test", location: "us-east-1", stack: "foo"])
-    targetServerGroup.instances = [[name: "i-1"]]
 
     when:
-    trafficGuard.verifyInstanceTermination("app-foo-v001", moniker, ["i-1"], "test", location, "aws", "x")
+    trafficGuard.verifyInstanceTermination(targetName, moniker, ["i-1"], "test", location, "aws", "x")
 
     then:
     notThrown(TrafficGuardException)
-    1 * front50Service.get("app") >> application
-    1 * oortHelper.getTargetServerGroup("test", "app-foo-v001", location.value, "aws") >> (targetServerGroup as TargetServerGroup)
+
+    // passes with no front50 check because the instance does not have healthState: Up
+    0 * front50Service.get("app") >> application
+    1 * oortHelper.getTargetServerGroup("test", targetName, location.value, "aws") >>
+      (makeServerGroup(targetName, 0, 0, [instances: [[name: "i-1"]]]) as TargetServerGroup)
     0 * _
   }
 
   private void addGuard(Map guard) {
+    if (!guard.containsKey("enabled")) {
+      guard.enabled = true
+    }
     applicationDetails.putIfAbsent("trafficGuards", [])
     applicationDetails.get("trafficGuards") << guard
   }
-
 }

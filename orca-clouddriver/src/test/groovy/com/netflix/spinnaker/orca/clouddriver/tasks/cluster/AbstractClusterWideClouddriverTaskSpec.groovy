@@ -18,12 +18,12 @@
 package com.netflix.spinnaker.orca.clouddriver.tasks.cluster
 
 import com.netflix.spinnaker.orca.TaskResult
+import com.netflix.spinnaker.orca.clouddriver.pipeline.cluster.AbstractClusterWideClouddriverOperationStage.ClusterSelection
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.CloneServerGroupStage
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.CreateServerGroupStage
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.DisableServerGroupStage
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.Location
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.TargetServerGroup
-import com.netflix.spinnaker.orca.clouddriver.tasks.cluster.AbstractClusterWideClouddriverTask.ClusterSelection
 import com.netflix.spinnaker.orca.clouddriver.utils.OortHelper
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Stage
@@ -78,6 +78,20 @@ class AbstractClusterWideClouddriverTaskSpec extends Specification {
   }
 
   @Unroll
+  def "shouldSkipTrafficGuardCheck=#skip for katoOps with #description"() {
+    expect:
+    AbstractClusterWideClouddriverTask.shouldSkipTrafficGuardCheck(katoOps) == skip
+
+    where:
+    skip  || description                  | katoOps
+    false || "no desiredPercentage"       | [[destroyServerGroup:[credentials:"test", accountName:"test", serverGroupName:"test-v468", asgName:"test-v468", cloudProvider:"cloud", region:"region"]]]
+    false || "a null desiredPercentage"   | [[disableServerGroup:[credentials:"test", accountName:"test", serverGroupName:"test-v468", asgName:"test-v468", cloudProvider:"cloud", region:"region", desiredPercentage:null]]]
+    false || "a desiredPercentage at 100" | [[disableServerGroup:[credentials:"test", accountName:"test", serverGroupName:"test-v468", asgName:"test-v468", cloudProvider:"cloud", region:"region", desiredPercentage:100]]]
+    true  || "a desiredPercentage at 50"  | [[disableServerGroup:[credentials:"test", accountName:"test", serverGroupName:"test-v468", asgName:"test-v468", cloudProvider:"cloud", region:"region", desiredPercentage:50]]]
+    true  || "only one partial disable"   | [[disableServerGroup:[credentials:"test", accountName:"test", serverGroupName:"test-v468", asgName:"test-v468", cloudProvider:"cloud", region:"region"]], [disableServerGroup:[credentials:"test", accountName:"test", serverGroupName:"test-v468", asgName:"test-v468", cloudProvider:"cloud", region:"region", desiredPercentage:50]]]
+  }
+
+  @Unroll
   def "should filter out server groups that are newer than parent deploys"() {
     when:
     def targetServerGroups = AbstractClusterWideClouddriverTask.filterParentAndNewerThanParentDeploys(
@@ -99,7 +113,9 @@ class AbstractClusterWideClouddriverTaskSpec extends Specification {
     given:
     def pipeline = Execution.newPipeline("orca")
     def stage = new Stage(pipeline, DisableServerGroupStage.PIPELINE_CONFIG_TYPE, [
-      continueIfClusterNotFound: true
+      continueIfClusterNotFound: true,
+      cluster: 'foo',
+      credentials: 'bar'
     ])
     def task = new AbstractClusterWideClouddriverTask() {
       @Override
@@ -108,7 +124,7 @@ class AbstractClusterWideClouddriverTaskSpec extends Specification {
       }
     }
     def oortHelper = Mock(OortHelper)
-    task.oortHelper = oortHelper;
+    task.oortHelper = oortHelper
 
     when:
     def result = task.execute(stage)
@@ -123,7 +139,9 @@ class AbstractClusterWideClouddriverTaskSpec extends Specification {
     given:
     def pipeline = Execution.newPipeline("orca")
     def stage = new Stage(pipeline, DisableServerGroupStage.PIPELINE_CONFIG_TYPE, [
-      continueIfClusterNotFound: true
+      continueIfClusterNotFound: true,
+      cluster: 'foo',
+      credentials: 'bar',
     ])
     def task = new AbstractClusterWideClouddriverTask() {
       @Override
@@ -132,7 +150,7 @@ class AbstractClusterWideClouddriverTaskSpec extends Specification {
       }
     }
     def oortHelper = Mock(OortHelper)
-    task.oortHelper = oortHelper;
+    task.oortHelper = oortHelper
 
     when:
     def result = task.execute(stage)
@@ -149,6 +167,7 @@ class AbstractClusterWideClouddriverTaskSpec extends Specification {
     def stage = new Stage(Execution.newPipeline("orca"), 'clusterSelection', [
       cluster: cluster,
       moniker: moniker,
+      credentials: 'foo'
     ])
     when:
     ClusterSelection selection = stage.mapTo(ClusterSelection)
@@ -158,7 +177,7 @@ class AbstractClusterWideClouddriverTaskSpec extends Specification {
 
     where:
     cluster       | moniker            | expected
-    'clustername' | ['app': 'appname'] | 'appname'
+    'clustername' | ['app': 'appname', cluster:'clustername'] | 'appname'
     'app-stack'   | null               | 'app'
 
   }

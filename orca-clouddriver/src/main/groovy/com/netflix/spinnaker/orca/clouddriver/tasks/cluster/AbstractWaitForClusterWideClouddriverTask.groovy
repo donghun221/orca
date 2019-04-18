@@ -19,6 +19,7 @@ package com.netflix.spinnaker.orca.clouddriver.tasks.cluster
 import com.netflix.spinnaker.orca.ExecutionStatus
 import com.netflix.spinnaker.orca.OverridableTimeoutRetryableTask
 import com.netflix.spinnaker.orca.TaskResult
+import com.netflix.spinnaker.orca.clouddriver.pipeline.cluster.AbstractClusterWideClouddriverOperationStage.ClusterSelection
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.TargetServerGroup
 import com.netflix.spinnaker.orca.clouddriver.tasks.AbstractCloudProviderAwareTask
 import com.netflix.spinnaker.orca.clouddriver.utils.OortHelper
@@ -46,12 +47,12 @@ abstract class AbstractWaitForClusterWideClouddriverTask extends AbstractCloudPr
   OortHelper oortHelper
 
   protected TaskResult missingClusterResult(Stage stage,
-                                            AbstractClusterWideClouddriverTask.ClusterSelection clusterSelection) {
+                                            ClusterSelection clusterSelection) {
     throw new IllegalStateException("no cluster details found for $clusterSelection")
   }
 
   protected TaskResult emptyClusterResult(Stage stage,
-                                          AbstractClusterWideClouddriverTask.ClusterSelection clusterSelection,
+                                          ClusterSelection clusterSelection,
                                           Map cluster) {
     throw new IllegalStateException("no server groups found in cluster $clusterSelection")
   }
@@ -64,10 +65,7 @@ abstract class AbstractWaitForClusterWideClouddriverTask extends AbstractCloudPr
       // Possible issue here for GCE if multiple server groups are named the same in
       // different zones but with the same region. However, this is not allowable by
       // Spinnaker constraints, so we're accepting the risk.
-      log.info "currentServerGroup.region: $it.region, currentServerGroup.name: $it.name"
-      log.info " deployServerGroup.region: $it.region,  deployServerGroup.name: $it.name"
       def isMatch = it.region == deployServerGroup.region && it.name == deployServerGroup.name
-      log.info "is match? $isMatch"
       isMatch
     })
     log.info "Server groups matching $deployServerGroup : $matchingServerGroups"
@@ -91,7 +89,7 @@ abstract class AbstractWaitForClusterWideClouddriverTask extends AbstractCloudPr
 
   @Override
   TaskResult execute(Stage stage) {
-    def clusterSelection = stage.mapTo(AbstractClusterWideClouddriverTask.ClusterSelection)
+    def clusterSelection = stage.mapTo(ClusterSelection)
 
     List<DeployServerGroup> remainingDeployServerGroups = stage.mapTo(RemainingDeployServerGroups).remainingDeployServerGroups
 

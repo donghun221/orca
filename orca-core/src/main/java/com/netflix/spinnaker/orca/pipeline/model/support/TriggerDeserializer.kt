@@ -46,6 +46,20 @@ internal class TriggerDeserializer
           get("repository").textValue(),
           get("tag").textValue()
         )
+        looksLikeConcourse() -> ConcourseTrigger(
+                get("type").textValue(),
+                get("correlationId")?.textValue(),
+                get("user")?.textValue() ?: "[anonymous]",
+                get("parameters")?.mapValue(parser) ?: mutableMapOf(),
+                get("artifacts")?.listValue(parser) ?: mutableListOf(),
+                get("notifications")?.listValue(parser) ?: mutableListOf(),
+                get("rebake")?.booleanValue() == true,
+                get("dryRun")?.booleanValue() == true,
+                get("strategy")?.booleanValue() == true
+        ).apply {
+          buildInfo = get("buildInfo")?.parseValue(parser)
+          properties = get("properties")?.parseValue(parser) ?: mutableMapOf()
+        }
         looksLikeJenkins() -> JenkinsTrigger(
           get("type").textValue(),
           get("correlationId")?.textValue(),
@@ -76,6 +90,18 @@ internal class TriggerDeserializer
           get("strategy")?.booleanValue() == true,
           get("parentExecution").parseValue<Execution>(parser),
           get("parentPipelineStageId")?.textValue()
+        )
+        looksLikeArtifactory() -> ArtifactoryTrigger(
+          get("type").textValue(),
+          get("correlationId")?.textValue(),
+          get("user")?.textValue() ?: "[anonymous]",
+          get("parameters")?.mapValue(parser) ?: mutableMapOf(),
+          get("artifacts")?.listValue(parser) ?: mutableListOf(),
+          get("notifications")?.listValue(parser) ?: mutableListOf(),
+          get("rebake")?.booleanValue() == true,
+          get("dryRun")?.booleanValue() == true,
+          get("strategy")?.booleanValue() == true,
+          get("artifactorySearchName").textValue()
         )
         looksLikeGit() -> GitTrigger(
           get("type").textValue(),
@@ -110,7 +136,7 @@ internal class TriggerDeserializer
           get("strategy")?.booleanValue() == true
         )
       }.apply {
-        other = mapValue(parser)
+        other = mapValue(parser) ?: mutableMapOf()
         resolvedExpectedArtifacts = get("resolvedExpectedArtifacts")?.listValue(parser) ?: mutableListOf()
       }
     }
@@ -124,17 +150,22 @@ internal class TriggerDeserializer
   private fun JsonNode.looksLikeJenkins() =
     hasNonNull("master") && hasNonNull("job") && hasNonNull("buildNumber")
 
+  private fun JsonNode.looksLikeConcourse() = get("type")?.textValue() == "concourse"
+
   private fun JsonNode.looksLikePipeline() =
     hasNonNull("parentExecution")
+
+  private fun JsonNode.looksLikeArtifactory() =
+    hasNonNull("artifactorySearchName")
 
   private fun JsonNode.looksLikeCustom() =
     customTriggerSuppliers.any { it.predicate.invoke(this) }
 
   private fun <E> JsonNode.listValue(parser: JsonParser) =
-    parser.codec.treeToValue(this, List::class.java) as List<E>
+    parser.codec.treeToValue(this, List::class.java) as? List<E>
 
   private fun <K, V> JsonNode.mapValue(parser: JsonParser) =
-    parser.codec.treeToValue(this, Map::class.java) as Map<K, V>
+    parser.codec.treeToValue(this, Map::class.java) as? Map<K, V>
 
   private inline fun <reified T> JsonNode.parseValue(parser: JsonParser): T =
     parser.codec.treeToValue(this, T::class.java)

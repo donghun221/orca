@@ -54,6 +54,14 @@ interface OortService {
                        @Path("location") String location,
                        @Path("manifest") String manifest)
 
+  @GET("/manifests/{account}/{location}/{kind}/cluster/{app}/{clusterName}/dynamic/{criteria}")
+  Manifest getDynamicManifest(@Path("account") String account,
+                              @Path("location") String location,
+                              @Path("kind") String kind,
+                              @Path("app") String app,
+                              @Path("clusterName") String clusterName,
+                              @Path("criteria") String criteria)
+
   @Deprecated
   @GET("/applications/{app}/serverGroups/{account}/{region}/{serverGroup}")
   Response getServerGroup(@Path("app") String app,
@@ -128,4 +136,13 @@ interface OortService {
 
   @GET('/tags')
   List<Map> getEntityTags(@QueryMap Map parameters)
+
+  @GET("/aws/cloudFormation/stacks/{stackId}")
+  Map getCloudFormationStack(@Path(value = "stackId", encode = false) String stackId)
+
+  @GET("/servicebroker/{account}/serviceInstance")
+  Map<String, Object> getServiceInstance(@Path("account") String account,
+                                         @Query("cloudProvider") String cloudProvider,
+                                         @Query("region") String region,
+                                         @Query("serviceInstanceName") String serviceInstanceName)
 }

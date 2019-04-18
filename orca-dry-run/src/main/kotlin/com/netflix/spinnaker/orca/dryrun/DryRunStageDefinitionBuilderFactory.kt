@@ -37,7 +37,13 @@ class DryRunStageDefinitionBuilderFactory(
     }
 
   private val Stage.shouldExecuteNormallyInDryRun: Boolean
-    get() = isManualJudgment || isPipeline || isExpressionPrecondition || isFindImage || isDetermineTargetServerGroup
+    get() = isManualJudgment ||
+      isPipeline ||
+      isExpressionPrecondition ||
+      isFindImage ||
+      isDetermineTargetServerGroup ||
+      isRollbackCluster ||
+      isEvalVariables
 
   private val Stage.isManualJudgment: Boolean
     get() = type == "manualJudgment"
@@ -65,4 +71,10 @@ class DryRunStageDefinitionBuilderFactory(
     get() = (context["preconditions"] as Iterable<Map<String, Any>>?)?.run {
       all { it["type"] == "expression" }
     } == true
+
+  private val Stage.isRollbackCluster: Boolean
+    get() = type == "rollbackCluster"
+
+  private val Stage.isEvalVariables: Boolean
+    get() = type == "evaluateVariables"
 }

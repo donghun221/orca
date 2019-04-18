@@ -16,22 +16,23 @@
 
 package com.netflix.spinnaker.orca.clouddriver.tasks.cluster
 
-import com.netflix.frigga.Names
-import com.netflix.spinnaker.moniker.Moniker
 import com.netflix.spinnaker.orca.ExecutionStatus
 import com.netflix.spinnaker.orca.RetryableTask
 import com.netflix.spinnaker.orca.TaskResult
 import com.netflix.spinnaker.orca.clouddriver.KatoService
+import com.netflix.spinnaker.orca.clouddriver.pipeline.cluster.AbstractClusterWideClouddriverOperationStage
+import com.netflix.spinnaker.orca.clouddriver.pipeline.cluster.AbstractClusterWideClouddriverOperationStage.ClusterSelection
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.CloneServerGroupStage
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.CreateServerGroupStage
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.Location
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.TargetServerGroup
 import com.netflix.spinnaker.orca.clouddriver.tasks.AbstractCloudProviderAwareTask
 import com.netflix.spinnaker.orca.clouddriver.utils.OortHelper
+import com.netflix.spinnaker.orca.clouddriver.utils.TrafficGuard
 import com.netflix.spinnaker.orca.kato.pipeline.CopyLastAsgStage
 import com.netflix.spinnaker.orca.kato.pipeline.DeployStage
+import com.netflix.spinnaker.orca.locks.LockingConfigurationProperties
 import com.netflix.spinnaker.orca.pipeline.model.Stage
-import groovy.transform.Canonical
 import groovy.util.logging.Slf4j
 import org.springframework.beans.factory.annotation.Autowired
 
@@ -59,30 +60,15 @@ abstract class AbstractClusterWideClouddriverTask extends AbstractCloudProviderA
 
   @Autowired OortHelper oortHelper
   @Autowired KatoService katoService
+  @Autowired TrafficGuard trafficGuard
 
-  @Canonical
-  static class ClusterSelection {
-    String cluster
-    Moniker moniker;
-    String cloudProvider = 'aws'
-    String credentials
-
-    @Override
-    String toString() {
-      "Cluster $cloudProvider/$credentials/$cluster/$moniker"
-    }
-
-    String getApplication() {
-      moniker?.app ?: Names.parseName(cluster).app
-    }
-
-  }
-
-  protected TaskResult missingClusterResult(Stage stage, ClusterSelection clusterSelection) {
+  protected TaskResult missingClusterResult(Stage stage,
+                                            ClusterSelection clusterSelection) {
     throw new IllegalStateException("No Cluster details found for $clusterSelection")
   }
 
-  protected TaskResult emptyClusterResult(Stage stage, ClusterSelection clusterSelection, Map cluster) {
+  protected TaskResult emptyClusterResult(Stage stage,
+                                          ClusterSelection clusterSelection, Map cluster) {
     throw new IllegalStateException("No ServerGroups found in cluster $clusterSelection")
   }
 
@@ -111,42 +97,34 @@ abstract class AbstractClusterWideClouddriverTask extends AbstractCloudProviderA
       return emptyClusterResult(stage, clusterSelection, cluster.get())
     }
 
-    def locations =
-      stage.context.namespaces
-      ? stage.context.namespaces.collect { new Location(type: Location.Type.NAMESPACE, value: it) }
-      : stage.context.regions
-        ? stage.context.regions.collect { new Location(type: Location.Type.REGION, value: it) }
-        : stage.context.zones
-          ? stage.context.zones.collect { new Location(type: Location.Type.ZONE, value: it) }
-          : stage.context.namespace
-            ? [new Location(type: Location.Type.NAMESPACE, value: stage.context.namespace)]
-            : stage.context.region
-              ? [new Location(type: Location.Type.REGION, value: stage.context.region)]
-              : []
+    def locations = AbstractClusterWideClouddriverOperationStage.locationsFromStage(stage.context)
 
     Location.Type exactLocationType = locations?.getAt(0)?.type
 
-    Map<Location, List<TargetServerGroup>> targetServerGroupsByLocation = serverGroups.collect {
+    Map<Location, List<TargetServerGroup>> serverGroupsByLocation = serverGroups.collect {
       new TargetServerGroup(it)
     }.groupBy { it.getLocation(exactLocationType) }
 
     List<TargetServerGroup> filteredServerGroups = locations.findResults { Location l ->
-      def tsgs = targetServerGroupsByLocation[l]
+      def tsgs = serverGroupsByLocation[l]
       if (!tsgs) {
         return null
       }
       filterServerGroups(stage, clusterSelection.credentials, l, tsgs) ?: null
     }.flatten()
-
     log.debug("Filtered cluster server groups (excluding parent deploys) in locations ${locations}: ${filteredServerGroups*.name}")
+    Map<Location, List<TargetServerGroup>> filteredServerGroupsByLocation = filteredServerGroups.groupBy { it.getLocation(exactLocationType) }
 
     List<Map<String, Map>> katoOps = filteredServerGroups.collect(this.&buildOperationPayloads.curry(stage)).flatten()
-
     log.debug("Kato ops for executionId (${stage.getExecution().getId()}): ${katoOps}")
-
     if (!katoOps) {
-      log.warn("$stage.execution.id: No server groups to operate on from $targetServerGroupsByLocation in $locations")
+      log.warn("$stage.execution.id: No server groups to operate on from $serverGroupsByLocation in $locations")
       return TaskResult.SUCCEEDED
+    }
+
+    if (!shouldSkipTrafficGuardCheck(katoOps)) {
+      checkTrafficGuards(filteredServerGroupsByLocation, serverGroupsByLocation,
+        clusterSelection.credentials, locations, clusterSelection.cloudProvider, getClouddriverOperation())
     }
 
     // "deploy.server.groups" is keyed by region, and all TSGs will have this value.
@@ -163,6 +141,30 @@ abstract class AbstractClusterWideClouddriverTask extends AbstractCloudProviderA
       "kato.last.task.id"   : taskId,
       "deploy.server.groups": locationGroups
     ])
+  }
+
+  private static boolean shouldSkipTrafficGuardCheck(List<Map<String, Map>> katoOps) {
+    // if any operation has a non-null desiredPercentage that indicates an entire server group is not going away
+    // (e.g. in the case of rolling red/black), let's bypass the traffic guard check
+    return katoOps.any {
+      it.values().any { it.desiredPercentage && it.desiredPercentage < 100 }
+    }
+  }
+
+  private void checkTrafficGuards(Map<Location, List<TargetServerGroup>> filteredServerGroupsByLocation,
+                                  Map<Location, List<TargetServerGroup>> serverGroupsByLocation,
+                                  String credentials, List<Location> locations, String cloudProvider,
+                                  String operationDescription) {
+    // only check traffic guards for destructive operations
+    // we assume resizeServerGroup is a resize to 0/0/0 here as in ScaleDownClusterTask
+    if (!(getClouddriverOperation() in ["disableServerGroup", "resizeServerGroup", "destroyServerGroup"])) {
+      return
+    }
+
+    for (Location location: locations) {
+      trafficGuard.verifyTrafficRemoval(filteredServerGroupsByLocation[location], serverGroupsByLocation[location],
+        credentials, String.format("Running %s on", getClouddriverOperation()))
+    }
   }
 
   protected Map buildOperationPayload(Stage stage, TargetServerGroup serverGroup) {

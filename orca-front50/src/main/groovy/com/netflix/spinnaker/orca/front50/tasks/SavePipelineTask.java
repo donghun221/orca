@@ -22,19 +22,16 @@ import com.netflix.spinnaker.orca.TaskResult;
 import com.netflix.spinnaker.orca.front50.Front50Service;
 import com.netflix.spinnaker.orca.front50.PipelineModelMutator;
 import com.netflix.spinnaker.orca.pipeline.model.Stage;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import retrofit.client.Response;
 
-import java.util.ArrayList;
-import java.util.Base64;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -82,17 +79,16 @@ public class SavePipelineTask implements RetryableTask {
         pipeline.put("index", existingPipeline.get("index"));
       }
     }
+    String serviceAccount = (String) stage.getContext().get("pipeline.serviceAccount");
+    if (serviceAccount != null) {
+      updateServiceAccount(pipeline, serviceAccount);
+    }
 
-    if (stage.getContext().containsKey("pipeline.serviceAccount")) {
-      String serviceAccount = (String) stage.getContext().get("pipeline.serviceAccount");
-      pipeline.put("serviceAccount", serviceAccount);
+    if (stage.getContext().get("pipeline.id") != null && pipeline.get("id") == null) {
+      pipeline.put("id", stage.getContext().get("pipeline.id"));
 
-      // Each trigger contains a runAsUser field.
-      // We'll update each one with the pipelineServiceAccount if not already set.
-      if (pipeline.containsKey("triggers")) {
-        List<Map<String, Object>> triggers = (List<Map<String, Object>>) pipeline.get("triggers");
-        triggers.forEach(trigger -> trigger.putIfAbsent("runAsUser", serviceAccount));
-      }
+      // We need to tell front50 to regenerate cron trigger id's
+      pipeline.put("regenerateCronTriggerIds", true);
     }
 
     pipelineModelMutators.stream().filter(m -> m.supports(pipeline)).forEach(m -> m.mutate(pipeline));
@@ -117,10 +113,19 @@ public class SavePipelineTask implements RetryableTask {
       }
     }
 
-    return new TaskResult(
-      (response.getStatus() == HttpStatus.OK.value()) ? ExecutionStatus.SUCCEEDED : ExecutionStatus.TERMINAL,
-      outputs
-    );
+    final ExecutionStatus status;
+    if (response.getStatus() == HttpStatus.OK.value()) {
+      status = ExecutionStatus.SUCCEEDED;
+    } else {
+      final Boolean isSavingMultiplePipelines = (Boolean) Optional
+        .ofNullable(stage.getContext().get("isSavingMultiplePipelines")).orElse(false);
+      if (isSavingMultiplePipelines) {
+        status = ExecutionStatus.FAILED_CONTINUE;
+      } else {
+        status = ExecutionStatus.TERMINAL;
+      }
+    }
+    return new TaskResult(status, outputs);
   }
 
   @Override
@@ -131,6 +136,28 @@ public class SavePipelineTask implements RetryableTask {
   @Override
   public long getTimeout() {
     return TimeUnit.SECONDS.toMillis(30);
+  }
+
+  private void updateServiceAccount(Map<String, Object> pipeline, String serviceAccount) {
+    if (StringUtils.isEmpty(serviceAccount) || !pipeline.containsKey("triggers")) {
+      return;
+    }
+
+    List<Map<String, Object>> triggers = (List<Map<String, Object>>) pipeline.get("triggers");
+    List<String> roles = (List<String>) pipeline.get("roles");
+    // Managed service acct but no roles; Remove runAsUserFrom triggers
+    if (roles == null || roles.isEmpty()) {
+      triggers.forEach(t -> t.remove("runAsUser", serviceAccount));
+      return;
+    }
+
+    // Managed Service account exists and roles are set; Update triggers
+    triggers.stream()
+      .filter(t -> {
+        String runAsUser = (String) t.get("runAsUser");
+        return runAsUser == null || runAsUser.endsWith("@managed-service-account");
+      })
+      .forEach(t -> t.put("runAsUser", serviceAccount));
   }
 
   private Map<String, Object> fetchExistingPipeline(Map<String, Object> newPipeline) {

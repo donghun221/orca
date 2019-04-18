@@ -16,19 +16,10 @@
 
 package com.netflix.spinnaker.orca.igor.tasks
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.netflix.spinnaker.kork.artifacts.model.Artifact
-import com.netflix.spinnaker.kork.core.RetrySupport
 import com.netflix.spinnaker.orca.ExecutionStatus
-import com.netflix.spinnaker.orca.TaskResult
-import com.netflix.spinnaker.orca.igor.BuildArtifactFilter
 import com.netflix.spinnaker.orca.igor.BuildService
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Stage
-import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository
-import com.netflix.spinnaker.orca.pipeline.tasks.artifacts.BindProducedArtifactsTask
-import com.netflix.spinnaker.orca.pipeline.util.ArtifactResolver
-import org.springframework.mock.env.MockEnvironment
 import retrofit.RetrofitError
 import retrofit.client.Response
 import spock.lang.Shared
@@ -37,13 +28,8 @@ import spock.lang.Subject
 import spock.lang.Unroll
 
 class MonitorJenkinsJobTaskSpec extends Specification {
-  def environment = new MockEnvironment()
-  def buildArtifactFilter = new BuildArtifactFilter(environment: environment)
-  def executionRepository = Mock(ExecutionRepository)
-  def artifactResolver = new ArtifactResolver(new ObjectMapper(), executionRepository)
-
   @Subject
-  MonitorJenkinsJobTask task = new MonitorJenkinsJobTask(buildArtifactFilter: buildArtifactFilter)
+  MonitorJenkinsJobTask task = new MonitorJenkinsJobTask()
 
   @Shared
   def pipeline = Execution.newPipeline("orca")
@@ -148,138 +134,6 @@ class MonitorJenkinsJobTaskSpec extends Specification {
     400        || null
   }
 
-  def "retrieves values from a property file if specified"() {
-
-    given:
-    def stage = new Stage(pipeline, "jenkins", [master: "builds", job: "orca", buildNumber: 4, propertyFile: "sample.properties"])
-
-    and:
-    task.buildService = Stub(BuildService) {
-      getBuild(stage.context.buildNumber, stage.context.master, stage.context.job) >> [result: 'SUCCESS', running: false]
-      getPropertyFile(stage.context.buildNumber, stage.context.propertyFile, stage.context.master, stage.context.job) >> [val1: "one", val2: "two"]
-    }
-    task.retrySupport = Spy(RetrySupport) {
-      _ * sleep(_) >> { /* do nothing */ }
-    }
-
-    when:
-    TaskResult result = task.execute(stage)
-
-    then:
-    result.context.val1 == 'one'
-    result.context.val2 == 'two'
-
-  }
-
-  def "retrieves complex from a property file"() {
-
-    given:
-    def stage = new Stage(pipeline, "jenkins", [master: "builds", job: "orca", buildNumber: 4, propertyFile: "sample.properties"])
-
-    and:
-    task.buildService = Stub(BuildService) {
-      getBuild(stage.context.buildNumber, stage.context.master, stage.context.job) >> [result: 'SUCCESS', running: false]
-      getPropertyFile(stage.context.buildNumber, stage.context.propertyFile, stage.context.master, stage.context.job) >>
-        [val1: "one", val2: [complex: true]]
-    }
-    task.retrySupport = Spy(RetrySupport) {
-      _ * sleep(_) >> { /* do nothing */ }
-    }
-
-    when:
-    TaskResult result = task.execute(stage)
-
-    then:
-    result.context.val1 == 'one'
-    result.context.val2 == [complex: true]
-
-  }
-
-  def "resolves artifact from a property file"() {
-
-    given:
-    def stage = new Stage(pipeline, "jenkins", [master: "builds",
-                                                job: "orca",
-                                                buildNumber: 4,
-                                                propertyFile: "sample.properties",
-                                                expectedArtifacts: [[matchArtifact: [type: "docker/image"]],]])
-    def bindTask = new BindProducedArtifactsTask()
-
-    and:
-    task.buildService = Stub(BuildService) {
-      getBuild(stage.context.buildNumber, stage.context.master, stage.context.job) >> [result: 'SUCCESS', running: false]
-      getPropertyFile(stage.context.buildNumber, stage.context.propertyFile, stage.context.master, stage.context.job) >>
-        [val1: "one", artifacts: [
-          [type: "docker/image",
-           reference: "gcr.io/project/my-image@sha256:28f82eba",
-           name: "gcr.io/project/my-image",
-           version: "sha256:28f82eba"],]]
-    }
-    task.retrySupport = Spy(RetrySupport) {
-      _ * sleep(_) >> { /* do nothing */ }
-    }
-    bindTask.artifactResolver = artifactResolver
-    bindTask.objectMapper = new ObjectMapper()
-
-
-    when:
-    def jenkinsResult = task.execute(stage)
-    // We don't have a pipeline, so we pass context manually
-    stage.context << jenkinsResult.context
-    def bindResult = bindTask.execute(stage)
-    def artifacts = bindResult.outputs["artifacts"]
-
-    then:
-    bindResult.status == ExecutionStatus.SUCCEEDED
-    artifacts.size() == 1
-    artifacts[0].name == "gcr.io/project/my-image"
-
-  }
-
-  def "retrieves values from a property file if specified after a failed attempt"() {
-
-    given:
-    def stage = new Stage(pipeline, "jenkins", [master: "builds", job: "orca", buildNumber: 4, propertyFile: "sample.properties"])
-
-    and:
-    task.buildService = Stub(BuildService) {
-      getBuild(stage.context.buildNumber, stage.context.master, stage.context.job) >> [result: 'SUCCESS', running: false]
-      getPropertyFile(stage.context.buildNumber, stage.context.propertyFile, stage.context.master, stage.context.job) >>> [[], [val1: "one", val2: "two"]]
-    }
-    task.retrySupport = Spy(RetrySupport) {
-      _ * sleep(_) >> { /* do nothing */ }
-    }
-
-    when:
-    TaskResult result = task.execute(stage)
-
-    then:
-    result.context.val1 == 'one'
-    result.context.val2 == 'two'
-
-  }
-
-  def "fails stage if property file is expected but not returned from jenkins and build passed"() {
-    given:
-    def stage = new Stage(pipeline, "jenkins", [master: 'builds', job: 'orca', buildNumber: 4, propertyFile: 'noexist.properties'])
-
-    and:
-    task.buildService = Stub(BuildService) {
-      getBuild(stage.context.buildNumber, stage.context.master, stage.context.job) >> [result: 'SUCCESS', running: false]
-      getPropertyFile(stage.context.buildNumber, stage.context.propertyFile, stage.context.master, stage.context.job) >> [:]
-    }
-    task.retrySupport = Spy(RetrySupport) {
-      _ * sleep(_) >> { /* do nothing */ }
-    }
-
-    when:
-    task.execute(stage)
-
-    then:
-    IllegalStateException e = thrown IllegalStateException
-    e.message == 'Expected properties file noexist.properties but it was either missing, empty or contained invalid syntax'
-  }
-
   def "marks 'unstable' results as successful if explicitly configured to do so"() {
     given:
     def stage = new Stage(pipeline, "jenkins",
@@ -300,46 +154,4 @@ class MonitorJenkinsJobTaskSpec extends Specification {
     false                    | ExecutionStatus.TERMINAL
     null                     | ExecutionStatus.TERMINAL
   }
-
-  @Unroll
-  def 'should filter artifacts in buildInfo based on environment configuration'() {
-    given:
-    environment.withProperty(BuildArtifactFilter.MAX_ARTIFACTS_PROP, maxArtifacts.toString())
-    environment.withProperty(BuildArtifactFilter.PREFERRED_ARTIFACTS_PROP, preferredArtifacts)
-
-    and:
-    def stage = new Stage(pipeline, "jenkins", [master: "builds", job: "orca", buildNumber: 4])
-
-    and:
-    task.buildService = Stub(BuildService) {
-      getBuild(stage.context.buildNumber, stage.context.master, stage.context.job) >> buildInfo
-    }
-
-    when:
-    def taskResult = task.execute(stage)
-
-    then:
-    taskResult.outputs.buildInfo.artifacts*.fileName == expectedArtifacts
-    taskResult.context.buildInfo.artifacts*.fileName == expectedArtifacts
-
-    where:
-    maxArtifacts | preferredArtifacts | expectedArtifacts
-    1            | 'deb'              | ['foo1.deb']
-    2            | 'deb'              | ['foo1.deb', 'foo2.rpm']
-    2            | 'deb,properties'   | ['foo1.deb', 'foo3.properties']
-    2            | 'properties,rpm'   | ['foo3.properties', 'foo2.rpm']
-    1            | 'nupkg'            | ['foo8.nupkg']
-
-    buildInfo = [result: "SUCCESS", artifacts: [
-      [fileName: 'foo1.deb'],
-      [fileName: 'foo2.rpm'],
-      [fileName: 'foo3.properties'],
-      [fileName: 'foo4.yml'],
-      [fileName: 'foo5.json'],
-      [fileName: 'foo6.xml'],
-      [fileName: 'foo7.txt'],
-      [fileName: 'foo8.nupkg'],
-    ]]
-  }
-
 }

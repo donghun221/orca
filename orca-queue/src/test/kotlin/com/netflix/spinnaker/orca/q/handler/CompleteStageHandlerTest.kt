@@ -19,6 +19,8 @@ package com.netflix.spinnaker.orca.q.handler
 import com.netflix.spectator.api.NoopRegistry
 import com.netflix.spinnaker.orca.ExecutionStatus.*
 import com.netflix.spinnaker.orca.events.StageComplete
+import com.netflix.spinnaker.orca.exceptions.DefaultExceptionHandler
+import com.netflix.spinnaker.orca.exceptions.ExceptionHandler
 import com.netflix.spinnaker.orca.fixture.pipeline
 import com.netflix.spinnaker.orca.fixture.stage
 import com.netflix.spinnaker.orca.fixture.task
@@ -33,6 +35,7 @@ import com.netflix.spinnaker.orca.pipeline.model.SyntheticStageOwner.STAGE_AFTER
 import com.netflix.spinnaker.orca.pipeline.model.SyntheticStageOwner.STAGE_BEFORE
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository
 import com.netflix.spinnaker.orca.pipeline.util.ContextParameterProcessor
+import com.netflix.spinnaker.orca.pipeline.util.StageNavigator
 import com.netflix.spinnaker.orca.q.*
 import com.netflix.spinnaker.q.Message
 import com.netflix.spinnaker.q.Queue
@@ -46,12 +49,15 @@ import org.jetbrains.spek.api.dsl.*
 import org.jetbrains.spek.api.lifecycle.CachingMode.GROUP
 import org.jetbrains.spek.subject.SubjectSpek
 import org.springframework.context.ApplicationEventPublisher
+import java.time.Duration.ZERO
 
 object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
 
   val queue: Queue = mock()
   val repository: ExecutionRepository = mock()
+  val stageNavigator: StageNavigator = mock()
   val publisher: ApplicationEventPublisher = mock()
+  val exceptionHandler: ExceptionHandler = DefaultExceptionHandler()
   val clock = fixedClock()
   val registry = NoopRegistry()
   val contextParameterProcessor: ContextParameterProcessor = mock()
@@ -101,8 +107,10 @@ object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
     CompleteStageHandler(
       queue,
       repository,
+      stageNavigator,
       publisher,
       clock,
+      listOf(exceptionHandler),
       contextParameterProcessor,
       registry,
       DefaultStageDefinitionBuilderFactory(
@@ -429,6 +437,12 @@ object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
             assertThat(pipeline.stageById(message.stageId).status).isEqualTo(TERMINAL)
           }
 
+          it("correctly records exception") {
+            assertThat(pipeline.stageById(message.stageId).context).containsKey("exception")
+            val exceptionContext = pipeline.stageById(message.stageId).context["exception"] as ExceptionHandler.Response
+            assertThat(exceptionContext.exceptionType).isEqualTo(RuntimeException().javaClass.simpleName)
+          }
+
           it("runs cancellation") {
             verify(queue).push(CancelStage(pipeline.stageById(message.stageId)))
           }
@@ -637,7 +651,7 @@ object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
                   assertThat(parentStageId).isEqualTo(message.stageId)
                   assertThat(name).isEqualTo("After Stage")
                 }
-                else          ->
+                else ->
                   fail("Expected a StartStage message but got a ${capturedMessage.javaClass.simpleName}")
               }
             }
@@ -886,10 +900,10 @@ object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
           }
 
           it("signals the parent stage to run") {
-            verify(queue).push(ContinueParentStage(
+            verify(queue).ensure(ContinueParentStage(
               pipeline.stageByRef("1"),
               STAGE_BEFORE
-            ))
+            ), ZERO)
           }
         }
       }
@@ -956,10 +970,10 @@ object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
 
           it("tells the parent stage to continue") {
             verify(queue)
-              .push(ContinueParentStage(
+              .ensure(ContinueParentStage(
                 pipeline.stageById(message.stageId).parent!!,
                 STAGE_AFTER
-              ))
+              ), ZERO)
           }
         }
       }
@@ -1034,6 +1048,43 @@ object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
         }
       }
     }
+
+    given("a synthetic stage's task ends with $TERMINAL status and parent stage should continue on failure") {
+      val pipeline = pipeline {
+        stage {
+          refId = "1"
+          context = mapOf("continuePipeline" to true) // should continue on failure
+          type = stageWithSyntheticBefore.type
+          stageWithSyntheticBefore.buildBeforeStages(this)
+          stageWithSyntheticBefore.plan(this)
+        }
+      }
+      val message = CompleteStage(pipeline.stageByRef("1<1"))
+
+      beforeGroup {
+        pipeline.stageById(message.stageId).apply {
+          status = RUNNING
+          singleTaskStage.plan(this)
+          tasks.first().status = TERMINAL
+        }
+
+        whenever(repository.retrieve(PIPELINE, message.executionId)) doReturn pipeline
+      }
+
+      on("receiving the message") {
+        subject.handle(message)
+      }
+
+      afterGroup(::resetMocks)
+
+      it("rolls up to the parent stage") {
+        verify(queue).push(message.copy(stageId = pipeline.stageByRef("1").id))
+      }
+
+      it("runs the parent stage's complete routine") {
+        verify(queue).push(CompleteStage(message.copy(stageId = pipeline.stageByRef("1").id)))
+      }
+    }
   }
 
   describe("branching stages") {
@@ -1068,7 +1119,7 @@ object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
 
         it("signals the parent stage to try to run") {
           verify(queue)
-            .push(ContinueParentStage(pipeline.stageByRef("1"), STAGE_BEFORE))
+            .ensure(ContinueParentStage(pipeline.stageByRef("1"), STAGE_BEFORE), ZERO)
         }
       }
 
@@ -1105,7 +1156,7 @@ object CompleteStageHandlerTest : SubjectSpek<CompleteStageHandler>({
 
         it("signals the parent stage to try to run") {
           verify(queue)
-            .push(ContinueParentStage(pipeline.stageByRef("1"), STAGE_BEFORE))
+            .ensure(ContinueParentStage(pipeline.stageByRef("1"), STAGE_BEFORE), ZERO)
         }
       }
     }

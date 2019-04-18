@@ -5,8 +5,11 @@ dependencies {
   compile project(":orca-extensionpoint")
   compile project(":orca-core")
   compile project(":orca-front50")
+  compile project(":orca-clouddriver")
 
-  compile('com.hubspot.jinjava:jinjava:2.2.3')
+  compile('com.hubspot.jinjava:jinjava:2.2.3') {
+    force = true
+  }
 
   compile "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:${spinnaker.version('jackson')}"
   compile "com.fasterxml.jackson.module:jackson-module-kotlin:${spinnaker.version("jackson")}"
@@ -20,6 +23,9 @@ dependencies {
   compile spinnaker.dependency("frigga")
   compile spinnaker.dependency('korkExceptions')
   compile spinnaker.dependency("okHttp3")
+
+  compileOnly spinnaker.dependency("lombok")
+  annotationProcessor spinnaker.dependency("lombok")
 
   testCompile spinnaker.dependency("slf4jSimple")
   testCompile 'org.spockframework:spock-unitils:1.1-groovy-2.4-rc-2'

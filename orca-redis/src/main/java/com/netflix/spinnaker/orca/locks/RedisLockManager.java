@@ -1,8 +1,23 @@
+/*
+ * Copyright 2018 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.netflix.spinnaker.orca.locks;
 
-import static net.logstash.logback.argument.StructuredArguments.kv;
-
 import com.netflix.spinnaker.kork.jedis.RedisClientDelegate;
+import com.netflix.spinnaker.kork.jedis.RedisClientSelector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,6 +30,7 @@ import java.util.Optional;
 import java.util.function.Consumer;
 
 import static java.util.Arrays.asList;
+import static net.logstash.logback.argument.StructuredArguments.kv;
 
 @Component
 public class RedisLockManager implements LockManager {
@@ -27,9 +43,9 @@ public class RedisLockManager implements LockManager {
   private final LockingConfigurationProperties lockingConfigurationProperties;
 
   @Autowired
-  public RedisLockManager(RedisClientDelegate redisClientDelegate,
+  public RedisLockManager(RedisClientSelector redisClientSelector,
                           LockingConfigurationProperties lockingConfigurationProperties) {
-    this.redisClientDelegate = redisClientDelegate;
+    this.redisClientDelegate = redisClientSelector.primary("default");
     this.lockingConfigurationProperties = lockingConfigurationProperties;
     if (!redisClientDelegate.supportsScripting()) {
       throw new IllegalArgumentException(

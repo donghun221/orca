@@ -21,11 +21,8 @@ import com.jakewharton.retrofit.Ok3Client
 import com.netflix.spectator.api.Registry
 import com.netflix.spinnaker.config.OkHttp3ClientConfiguration
 import com.netflix.spinnaker.config.OkHttpClientConfiguration
-import com.netflix.spinnaker.okhttp.OkHttp3MetricsInterceptor
-import com.netflix.spinnaker.okhttp.OkHttpMetricsInterceptor
 import com.netflix.spinnaker.orca.retrofit.exceptions.RetrofitExceptionHandler
 import groovy.transform.CompileStatic
-import okhttp3.ConnectionPool
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
@@ -42,48 +39,41 @@ import org.springframework.core.annotation.Order
 import retrofit.RestAdapter.LogLevel
 import retrofit.client.OkClient
 
-import java.util.concurrent.TimeUnit
-
 @Configuration
 @CompileStatic
 @Import(OkHttp3ClientConfiguration)
 @EnableConfigurationProperties
 class RetrofitConfiguration {
+  @Bean(name = ["retrofitClient"])
+  @Scope(ConfigurableBeanFactory.SCOPE_SINGLETON)
+  Ok3Client ok3Client(Registry registry,
+                      OkHttp3ClientConfiguration okHttpClientConfig,
+                      Optional<List<RetrofitInterceptorProvider>> retrofitInterceptorProviders) {
+    final String userAgent = "Spinnaker-${System.getProperty('spring.application.name', 'unknown')}/${getClass().getPackage().implementationVersion ?: '1.0'}"
+    OkHttpClient.Builder builder = okHttpClientConfig.create()
+    builder.addNetworkInterceptor(
+      new Interceptor() {
+        @Override
+        Response intercept(Interceptor.Chain chain) throws IOException {
+          def req = chain.request().newBuilder().header('User-Agent', userAgent).build()
+          chain.proceed(req)
+        }
+      })
 
-   @Value('${okHttpClient.connectionPool.maxIdleConnections:5}')
-   int maxIdleConnections
+    (retrofitInterceptorProviders.orElse([])).each { provider ->
+      provider.interceptors.each { interceptor ->
+        builder.addInterceptor(interceptor);
+      }
+    }
 
-   @Value('${okHttpClient.connectionPool.keepAliveDurationMs:300000}')
-   int keepAliveDurationMs
-
-   @Value('${okHttpClient.retryOnConnectionFailure:true}')
-   boolean retryOnConnectionFailure
-
-   @Bean(name = ["retrofitClient"])
-   @Scope(ConfigurableBeanFactory.SCOPE_SINGLETON)
-   Ok3Client ok3Client(Registry registry, OkHttp3ClientConfiguration okHttpClientConfig) {
-     final String userAgent = "Spinnaker-${System.getProperty('spring.application.name', 'unknown')}/${getClass().getPackage().implementationVersion ?: '1.0'}"
-     OkHttpClient.Builder builder = okHttpClientConfig.create()
-     builder.addNetworkInterceptor(
-       new Interceptor() {
-         @Override
-         Response intercept(Interceptor.Chain chain) throws IOException {
-           def req = chain.request().newBuilder().header('User-Agent', userAgent).build()
-           chain.proceed(req)
-         }
-       })
-     .addInterceptor(
-       new OkHttp3MetricsInterceptor(registry)
-     )
-       .connectionPool(new ConnectionPool(maxIdleConnections, keepAliveDurationMs, TimeUnit.MILLISECONDS))
-       .retryOnConnectionFailure(retryOnConnectionFailure)
-
-     new Ok3Client(builder.build())
+    new Ok3Client(builder.build())
   }
 
   @Bean
   @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
-  OkClient okClient(Registry registry, @Qualifier("okHttpClientConfiguration") OkHttpClientConfiguration okHttpClientConfig) {
+  OkClient okClient(Registry registry,
+                    @Qualifier("okHttpClientConfiguration") OkHttpClientConfiguration okHttpClientConfig,
+                    Optional<List<RetrofitInterceptorProvider>> retrofitInterceptorProviders) {
     final String userAgent = "Spinnaker-${System.getProperty('spring.application.name', 'unknown')}/${getClass().getPackage().implementationVersion ?: '1.0'}"
     def cfg = okHttpClientConfig.create()
     cfg.networkInterceptors().add(new com.squareup.okhttp.Interceptor() {
@@ -93,21 +83,24 @@ class RetrofitConfiguration {
         chain.proceed(req)
       }
     })
-    cfg.interceptors().add(
-      new OkHttpMetricsInterceptor(registry)
-    )
-    cfg.setConnectionPool(new com.squareup.okhttp.ConnectionPool(maxIdleConnections, keepAliveDurationMs))
-    cfg.retryOnConnectionFailure = retryOnConnectionFailure
+
+    (retrofitInterceptorProviders.orElse([])).each { provider ->
+      provider.legacyInterceptors.each { interceptor ->
+        cfg.interceptors().add(interceptor)
+      }
+    }
 
     new OkClient(cfg)
   }
 
-  @Bean LogLevel retrofitLogLevel(@Value('${retrofit.logLevel:BASIC}') String retrofitLogLevel) {
+  @Bean
+  LogLevel retrofitLogLevel(@Value('${retrofit.logLevel:BASIC}') String retrofitLogLevel) {
     return LogLevel.valueOf(retrofitLogLevel)
   }
 
-  @Bean @Order(Ordered.HIGHEST_PRECEDENCE) RetrofitExceptionHandler retrofitExceptionHandler() {
+  @Bean
+  @Order(Ordered.HIGHEST_PRECEDENCE)
+  RetrofitExceptionHandler retrofitExceptionHandler() {
     new RetrofitExceptionHandler()
   }
-
 }

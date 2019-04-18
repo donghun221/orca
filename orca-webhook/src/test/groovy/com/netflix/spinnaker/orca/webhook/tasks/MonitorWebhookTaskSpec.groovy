@@ -70,6 +70,45 @@ class MonitorWebhookTaskSpec extends Specification {
     ex.message == "Missing required parameters 'statusEndpoint', 'statusJsonPath'" as String
   }
 
+  def "should fail in case of URL validation error"() {
+    setup:
+    def stage = new Stage(pipeline, "webhook", [
+      statusEndpoint: 'https://my-service.io/api/status/123',
+      statusJsonPath: '$.status'])
+
+    monitorWebhookTask.webhookService = Stub(WebhookService) {
+      getStatus(_, _) >> {
+        throw new IllegalArgumentException("Invalid URL")
+      }
+    }
+
+    when:
+    monitorWebhookTask.execute stage
+
+    then:
+    def ex = thrown IllegalArgumentException
+    ex.message == "Invalid URL"
+  }
+
+  def "should retry in case of name resolution error"() {
+    setup:
+    def stage = new Stage(pipeline, "webhook", [
+      statusEndpoint: 'https://my-service.io/api/status/123',
+      statusJsonPath: '$.status'])
+
+    monitorWebhookTask.webhookService = Stub(WebhookService) {
+      getStatus(_, _) >> {
+        throw new IllegalArgumentException("Invalid URL", new UnknownHostException())
+      }
+    }
+
+    when:
+    def result = monitorWebhookTask.execute stage
+
+    then:
+    result.status == ExecutionStatus.RUNNING
+  }
+
   def "should do a get request to the defined statusEndpoint"() {
     setup:
     monitorWebhookTask.webhookService = Mock(WebhookService) {
@@ -90,7 +129,7 @@ class MonitorWebhookTaskSpec extends Specification {
 
     then:
     result.status == ExecutionStatus.RUNNING
-    result.context.webhook.monitor == [body: [status: "RUNNING"], statusCode: HttpStatus.OK]
+    result.context.webhook.monitor == [body: [status: "RUNNING"], statusCode: HttpStatus.OK, statusCodeValue: HttpStatus.OK.value()]
   }
 
   def "should find correct element using statusJsonPath parameter"() {
@@ -112,7 +151,7 @@ class MonitorWebhookTaskSpec extends Specification {
 
     then:
     result.status == ExecutionStatus.TERMINAL
-    result.context.webhook.monitor == [body: [status: "TERMINAL"], statusCode: HttpStatus.OK]
+    result.context.webhook.monitor == [body: [status: "TERMINAL"], statusCode: HttpStatus.OK, statusCodeValue: HttpStatus.OK.value()]
   }
 
   def "should return percentComplete if supported by endpoint"() {
@@ -135,7 +174,7 @@ class MonitorWebhookTaskSpec extends Specification {
 
     then:
     result.status == ExecutionStatus.RUNNING
-    result.context.webhook.monitor == [percentComplete: 42, body: [status: 42], statusCode: HttpStatus.OK]
+    result.context.webhook.monitor == [percentComplete: 42, body: [status: 42], statusCode: HttpStatus.OK, statusCodeValue: HttpStatus.OK.value()]
   }
 
   def "100 percent complete should result in SUCCEEDED status"() {
@@ -157,7 +196,7 @@ class MonitorWebhookTaskSpec extends Specification {
 
     then:
     result.status == ExecutionStatus.SUCCEEDED
-    result.context.webhook.monitor == [percentComplete: 100, body: [status: 100], statusCode: HttpStatus.OK]
+    result.context.webhook.monitor == [percentComplete: 100, body: [status: 100], statusCode: HttpStatus.OK, statusCodeValue: HttpStatus.OK.value()]
   }
 
   def "should return TERMINAL status if jsonPath can not be found"() {
@@ -176,7 +215,7 @@ class MonitorWebhookTaskSpec extends Specification {
 
     then:
     result.status == ExecutionStatus.TERMINAL
-    result.context.webhook.monitor == [error: 'Missing property in path $[\'doesnt\']', body: [status: "SUCCESS"], statusCode: HttpStatus.OK]
+    result.context.webhook.monitor == [error: 'Unable to parse status: JSON property \'$.doesnt.exist\' not found in response body', body: [status: "SUCCESS"], statusCode: HttpStatus.OK, statusCodeValue: HttpStatus.OK.value()]
   }
 
   def "should return TERMINAL status if jsonPath isn't evaluated to single value"() {
@@ -199,7 +238,8 @@ class MonitorWebhookTaskSpec extends Specification {
       error: "The json path '\$.status' did not resolve to a single value",
       resolvedValue: ["some", "complex", "list"],
       body: [status: ["some", "complex", "list"]],
-      statusCode: HttpStatus.OK
+      statusCode: HttpStatus.OK,
+      statusCodeValue: HttpStatus.OK.value()
     ]
   }
 }

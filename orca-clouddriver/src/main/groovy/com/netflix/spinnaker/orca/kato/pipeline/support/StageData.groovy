@@ -18,8 +18,12 @@ package com.netflix.spinnaker.orca.kato.pipeline.support
 
 import com.netflix.frigga.autoscaling.AutoScalingGroupNameBuilder
 import com.netflix.spinnaker.moniker.Moniker
+import groovy.transform.EqualsAndHashCode
+import groovy.transform.ToString
 
 class StageData {
+  public static final EMPTY_SOURCE = new Source()
+
   String strategy
   String account
   String credentials
@@ -34,6 +38,9 @@ class StageData {
   boolean scaleDown
   Map<String, List<String>> availabilityZones
   int maxRemainingAsgs
+  Boolean allowDeleteActive
+  Boolean allowScaleDownActive
+  int maxInitialAsgs = 1
   Boolean useSourceCapacity
   Boolean preferSourceCapacity
   Source source
@@ -97,6 +104,8 @@ class StageData {
     return preferSourceCapacity ?: false
   }
 
+  @EqualsAndHashCode
+  @ToString
   static class Source {
     String account
     String region

@@ -17,6 +17,7 @@
 
 package com.netflix.spinnaker.orca.webhook.tasks
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.netflix.spinnaker.orca.ExecutionStatus
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Stage
@@ -25,8 +26,10 @@ import org.springframework.http.HttpHeaders
 import org.springframework.http.HttpMethod
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
+import org.springframework.web.client.HttpServerErrorException
 import spock.lang.Specification
 import spock.lang.Subject
+import java.nio.charset.Charset
 
 class CreateWebhookTaskSpec extends Specification {
 
@@ -62,7 +65,8 @@ class CreateWebhookTaskSpec extends Specification {
       deprecationWarning: "All webhook information will be moved beneath the key 'webhook', and the keys 'statusCode', 'buildInfo', 'statusEndpoint' and 'error' will be removed. Please migrate today.",
       statusCode: HttpStatus.OK,
       webhook: [
-        statusCode: HttpStatus.OK
+        statusCode: HttpStatus.OK,
+        statusCodeValue: HttpStatus.OK.value()
       ]
     ]
   }
@@ -121,6 +125,7 @@ class CreateWebhookTaskSpec extends Specification {
       payload: [:],
       customHeaders: [:]
     ])
+    def bodyString = "Oh noes, you can't do this"
 
     createWebhookTask.webhookService = Stub(WebhookService) {
       exchange(
@@ -128,7 +133,7 @@ class CreateWebhookTaskSpec extends Specification {
         "https://my-service.io/api/",
         [:],
         [:]
-      ) >> new ResponseEntity<Map>([error: "Oh noes, you can't do this"], HttpStatus.BAD_REQUEST)
+      ) >> new ResponseEntity<Map>([error: bodyString], HttpStatus.BAD_REQUEST)
     }
 
     when:
@@ -139,13 +144,200 @@ class CreateWebhookTaskSpec extends Specification {
     result.context as Map == [
       deprecationWarning: "All webhook information will be moved beneath the key 'webhook', and the keys 'statusCode', 'buildInfo', 'statusEndpoint' and 'error' will be removed. Please migrate today.",
       statusCode: HttpStatus.BAD_REQUEST,
-      buildInfo: [error: "Oh noes, you can't do this"],
+      buildInfo: [error: bodyString],
       webhook: [
         statusCode: HttpStatus.BAD_REQUEST,
-        body: [error: "Oh noes, you can't do this"],
-        error: "The request did not return a 2xx/3xx status"
+        statusCodeValue: HttpStatus.BAD_REQUEST.value(),
+        body: [error: bodyString],
+        error: "The webhook request failed"
       ]
     ]
+  }
+
+  def "should retry on HTTP status 429"() {
+    setup:
+    def stage = new Stage(pipeline, "webhook", "My webhook", [
+      url: "https://my-service.io/api/",
+      method: "delete",
+      payload: [:],
+      customHeaders: [:]
+    ])
+
+    createWebhookTask.webhookService = Stub(WebhookService) {
+      exchange(
+        HttpMethod.DELETE,
+        "https://my-service.io/api/",
+        [:],
+        [:]
+      ) >> { throwHttpException(HttpStatus.TOO_MANY_REQUESTS, null) }
+    }
+
+    when:
+    def result = createWebhookTask.execute(stage)
+
+    then:
+    def errorMessage = "error submitting webhook for pipeline ${stage.execution.id} to ${stage.context.url}, will retry."
+
+    result.status == ExecutionStatus.RUNNING
+    (result.context as Map) == [
+      webhook: [
+        statusCode: HttpStatus.TOO_MANY_REQUESTS,
+        statusCodeValue: HttpStatus.TOO_MANY_REQUESTS.value(),
+        error: errorMessage
+      ]
+    ]
+  }
+
+  def "should retry on name resolution failure"() {
+    setup:
+    def stage = new Stage(pipeline, "webhook", "My webhook", [:])
+
+    createWebhookTask.webhookService = Stub(WebhookService) {
+      exchange(_, _, _, _) >> {
+        // throwing it like UserConfiguredUrlRestrictions::validateURI does
+        throw new IllegalArgumentException("Invalid URL", new UnknownHostException("Temporary failure in name resolution"))
+      }
+    }
+
+    when:
+    def result = createWebhookTask.execute(stage)
+
+    then:
+    result.status == ExecutionStatus.RUNNING
+    (result.context as Map) == [
+      webhook: [
+        error: "name resolution failure in webhook for pipeline ${stage.execution.id} to ${stage.context.url}, will retry."
+      ]
+    ]
+  }
+
+  def "should return TERMINAL on URL validation failure"() {
+    setup:
+    def stage = new Stage(pipeline, "webhook", "My webhook", [url: "wrong://my-service.io/api/"])
+
+    createWebhookTask.webhookService = Stub(WebhookService) {
+      exchange(_, _, _, _) >> {
+        throw new IllegalArgumentException("Invalid URL")
+      }
+    }
+
+    when:
+    def result = createWebhookTask.execute(stage)
+
+    then:
+    result.status == ExecutionStatus.TERMINAL
+    (result.context as Map) == [
+      webhook: [
+        error: "an exception occurred in webhook to wrong://my-service.io/api/: java.lang.IllegalArgumentException: Invalid URL"
+      ]
+    ]
+  }
+
+  def "should parse response correctly on failure"() {
+    setup:
+    def stage = new Stage(pipeline, "webhook", "My webhook", [
+      url: "https://my-service.io/api/",
+      method: "delete",
+      payload: [:],
+      customHeaders: [:]
+    ])
+    
+    HttpStatus statusCode = HttpStatus.BAD_REQUEST
+
+    createWebhookTask.webhookService = Stub(WebhookService) {
+      exchange(
+        HttpMethod.DELETE,
+        "https://my-service.io/api/",
+        [:],
+        [:]
+      ) >> { throwHttpException(statusCode, bodyString) }
+    }
+
+    when:
+    def result = createWebhookTask.execute(stage)
+
+    then:
+    def errorMessage = "Error submitting webhook for pipeline ${stage.execution.id} to ${stage.context.url} with status code ${statusCode.value()}."
+
+    result.status == ExecutionStatus.TERMINAL
+    (result.context as Map) == [
+      webhook: [
+        statusCode: statusCode,
+        statusCodeValue: statusCode.value(),
+        body: body,
+        error: errorMessage
+      ]
+    ]
+
+    where:
+    bodyString                                | body
+    "true"                                    | "true"
+    "123"                                     | "123"
+    "{\"bad json\":"                          | "{\"bad json\":"
+    "{\"key\" : {\"subkey\" : \"subval\"}}"   | [key: [subkey: "subval"]]
+    "[\"1\", {\"k\": \"v\"}, 2]"              | ["1", [k: "v"], 2]
+  }
+
+  def "should return TERMINAL status if webhook returns one of fail fast HTTP status codes"() {
+    setup:
+    def stage = new Stage(pipeline, "webhook", "My webhook", [
+      url: "https://my-service.io/api/",
+      method: "get",
+      payload: [:],
+      customHeaders: [:],
+      "failFastStatusCodes": [503]
+    ])
+    def bodyString = "Fail fast, ok?"
+
+    createWebhookTask.webhookService = Stub(WebhookService) {
+      exchange(
+        HttpMethod.GET,
+        "https://my-service.io/api/",
+        [:],
+        [:]
+      ) >> { throwHttpException(HttpStatus.SERVICE_UNAVAILABLE, bodyString) }
+    }
+
+    when:
+    def result = createWebhookTask.execute(stage)
+
+    then:
+    result.status == ExecutionStatus.TERMINAL
+    result.context as Map == [
+      webhook: [
+        error: "Received a status code configured to fail fast, terminating stage.",
+        statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+        statusCodeValue: HttpStatus.SERVICE_UNAVAILABLE.value(),
+        body: bodyString
+      ]
+    ]
+  }
+
+  def "should throw on invalid payload"() {
+    setup:
+    def stage = new Stage(pipeline, "webhook", "My webhook", [
+      url: "https://my-service.io/api/",
+      method: "get",
+      payload: [:],
+      customHeaders: [:],
+      "failFastStatusCodes": 503
+    ])
+    def bodyString = "Fail fast, ok?"
+
+    createWebhookTask.webhookService = Stub(WebhookService) {
+      exchange(
+        HttpMethod.GET,
+        "https://my-service.io/api/",
+        [:],
+        [:]
+      ) >> { throwHttpException(HttpStatus.SERVICE_UNAVAILABLE, bodyString) }
+    }
+
+    when:
+    createWebhookTask.execute(stage)
+
+    then:
+    thrown IllegalArgumentException
   }
 
   def "if statusUrlResolution is getMethod, should return SUCCEEDED status"() {
@@ -171,6 +363,7 @@ class CreateWebhookTaskSpec extends Specification {
       buildInfo: [success: true],
       webhook: [
         statusCode: HttpStatus.CREATED,
+        statusCodeValue: HttpStatus.CREATED.value(),
         body: [success: true],
         statusEndpoint: "https://my-service.io/api/"
       ]
@@ -203,6 +396,7 @@ class CreateWebhookTaskSpec extends Specification {
       buildInfo: [success: true],
       webhook: [
         statusCode: HttpStatus.CREATED,
+        statusCodeValue: HttpStatus.CREATED.value(),
         body: [success: true],
         statusEndpoint: "https://my-service.io/api/status/123"
       ]
@@ -236,6 +430,7 @@ class CreateWebhookTaskSpec extends Specification {
       buildInfo: body,
       webhook: [
         statusCode: HttpStatus.CREATED,
+        statusCodeValue: HttpStatus.CREATED.value(),
         body: body,
         statusEndpoint: "https://my-service.io/api/status/123"
       ]
@@ -272,6 +467,7 @@ class CreateWebhookTaskSpec extends Specification {
     result.context as Map == [
       webhook: [
         statusCode: HttpStatus.CREATED,
+        statusCodeValue: HttpStatus.CREATED.value(),
         body: body,
         error: "The status URL couldn't be resolved, but 'Wait for completion' was checked",
         statusEndpoint: ["this", "is", "a", "list"]
@@ -337,6 +533,7 @@ class CreateWebhookTaskSpec extends Specification {
       buildInfo: "<html></html>",
       webhook: [
         statusCode: HttpStatus.OK,
+        statusCodeValue: HttpStatus.OK.value(),
         body: "<html></html>"
       ]
     ]
@@ -369,8 +566,21 @@ class CreateWebhookTaskSpec extends Specification {
       deprecationWarning: "All webhook information will be moved beneath the key 'webhook', and the keys 'statusCode', 'buildInfo', 'statusEndpoint' and 'error' will be removed. Please migrate today.",
       statusCode: HttpStatus.OK,
       webhook: [
-        statusCode: HttpStatus.OK
+        statusCode: HttpStatus.OK,
+        statusCodeValue: HttpStatus.OK.value(),
       ]
     ]
+  }
+
+  private HttpServerErrorException throwHttpException(HttpStatus statusCode, String body) {
+    if (body != null) {
+      throw new HttpServerErrorException(
+        statusCode,
+        statusCode.name(),
+        body.getBytes(Charset.defaultCharset()),
+        Charset.defaultCharset())
+    }
+
+    throw new HttpServerErrorException(statusCode, statusCode.name())
   }
 }

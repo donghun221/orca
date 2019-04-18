@@ -22,8 +22,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.annotations.VisibleForTesting;
 import com.netflix.spinnaker.kork.artifacts.model.Artifact;
 import com.netflix.spinnaker.orca.pipeline.model.Stage;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import static com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType.PIPELINE;
 import static java.lang.String.format;
 import static java.util.Collections.emptyList;
@@ -41,8 +39,6 @@ import static java.util.stream.Collectors.toList;
  * If your trigger contains the Artifacts field, this class will also look for version information in there.
  */
 public class PackageInfo {
-
-  private final Logger log = LoggerFactory.getLogger(getClass());
 
   private final ObjectMapper mapper;
   private final Stage stage;
@@ -231,7 +227,7 @@ public class PackageInfo {
       if (packageIdentifier != null) {
         if (extractBuildDetails) {
           Map<String, Object> buildInfoForDetails = !buildArtifact.isEmpty() ? buildInfoCurrentExecution : triggerBuildInfo;
-          buildDetailExtractor.tryToExtractBuildDetails(buildInfoForDetails, stageContext);
+          buildDetailExtractor.tryToExtractJenkinsBuildDetails(buildInfoForDetails, stageContext);
         }
       }
     }
@@ -282,12 +278,21 @@ public class PackageInfo {
 
   private String extractPackageVersion(Map<String, Object> artifact, String filePrefix, String fileExtension) {
     String fileName = artifact.get("fileName").toString();
+    if (packageType.equals("rpm")) {
+      return extractRpmVersion(fileName);
+    }
     String version = fileName.substring(fileName.indexOf(filePrefix) + filePrefix.length(), fileName.lastIndexOf(fileExtension));
     if (version.contains(versionDelimiter)) {
       // further strip in case of _all is in the file name
       version = version.substring(0, version.indexOf(versionDelimiter));
     }
     return version;
+  }
+
+  private String extractRpmVersion(String fileName) {
+    String[] parts = fileName.split(versionDelimiter);
+    String suffix = parts[parts.length - 1].replaceAll(".rpm", "");
+    return parts[parts.length - 2] + versionDelimiter + suffix;
   }
 
   private Map<String, Object> filterArtifacts(List<Map<String, Object>> artifacts, String prefix, String fileExtension) {

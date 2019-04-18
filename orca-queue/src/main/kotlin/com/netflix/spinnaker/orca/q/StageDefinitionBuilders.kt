@@ -38,6 +38,13 @@ fun StageDefinitionBuilder.buildTasks(stage: Stage) {
     .forEachWithMetadata { processTaskNode(stage, it) }
 }
 
+fun StageDefinitionBuilder.addContextFlags(stage: Stage) {
+  if (canManuallySkip()) {
+    // Provides a flag for the UI to indicate that the stage can be skipped.
+    stage.context["canManuallySkip"] = true
+  }
+}
+
 private fun processTaskNode(
   stage: Stage,
   element: IteratorElement<TaskNode>,
@@ -135,7 +142,7 @@ private fun Stage.buildExecutionWindow(): Stage? {
       execution,
       RestrictExecutionDuringTimeWindow.TYPE,
       RestrictExecutionDuringTimeWindow.TYPE,
-      context.filterKeys { it != "restrictExecutionDuringTimeWindow" },
+      context.filterKeys { it !in setOf("restrictExecutionDuringTimeWindow", "stageTimeoutMs") },
       this,
       STAGE_BEFORE
     )

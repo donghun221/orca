@@ -24,6 +24,7 @@ import com.netflix.spinnaker.orca.exceptions.ExceptionHandler
 import com.netflix.spinnaker.orca.exceptions.TimeoutException
 import com.netflix.spinnaker.orca.ext.beforeStages
 import com.netflix.spinnaker.orca.ext.failureStatus
+import com.netflix.spinnaker.orca.ext.isManuallySkipped
 import com.netflix.spinnaker.orca.pipeline.RestrictExecutionDuringTimeWindow
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType
@@ -40,7 +41,8 @@ import com.netflix.spinnaker.orca.time.toDuration
 import com.netflix.spinnaker.orca.time.toInstant
 import com.netflix.spinnaker.q.Message
 import com.netflix.spinnaker.q.Queue
-import org.apache.commons.lang.time.DurationFormatUtils
+import org.apache.commons.lang3.time.DurationFormatUtils
+import org.slf4j.MDC
 import org.springframework.stereotype.Component
 import java.time.Clock
 import java.time.Duration
@@ -66,11 +68,13 @@ class RunTaskHandler(
   override fun handle(message: RunTask) {
     message.withTask { origStage, taskModel, task ->
       var stage = origStage
-      taskExecutionInterceptors.forEach { t -> stage = t.beforeTaskExecution(task, stage) }
-      val execution = stage.execution
+
       val thisInvocationStartTimeMs = clock.millis()
+      val execution = stage.execution
 
       try {
+        taskExecutionInterceptors.forEach { t -> stage = t.beforeTaskExecution(task, stage) }
+
         if (execution.isCanceled) {
           task.onCancel(stage)
           queue.push(CompleteTask(message, CANCELED))
@@ -78,6 +82,8 @@ class RunTaskHandler(
           queue.push(CompleteTask(message, CANCELED))
         } else if (execution.status == PAUSED) {
           queue.push(PauseTask(message))
+        } else if (stage.isManuallySkipped()) {
+          queue.push(CompleteTask(message, SKIPPED))
         } else {
           try {
             task.checkForTimeout(stage, taskModel, message)
@@ -90,33 +96,35 @@ class RunTaskHandler(
           }
 
           stage.withAuth {
-            var taskResult = task.execute(stage.withMergedContext())
-            taskExecutionInterceptors.forEach { t -> taskResult = t.afterTaskExecution(task, stage, taskResult) }
-            taskResult.let { result: TaskResult ->
-              // TODO: rather send this data with CompleteTask message
-              stage.processTaskOutput(result)
-              when (result.status) {
-                RUNNING                              -> {
-                  queue.push(message, task.backoffPeriod(taskModel, stage))
-                  trackResult(stage, thisInvocationStartTimeMs, taskModel, result.status)
+            stage.withLoggingContext(taskModel) {
+              var taskResult = task.execute(stage.withMergedContext())
+              taskExecutionInterceptors.forEach { t -> taskResult = t.afterTaskExecution(task, stage, taskResult) }
+              taskResult.let { result: TaskResult ->
+                // TODO: rather send this data with CompleteTask message
+                stage.processTaskOutput(result)
+                when (result.status) {
+                  RUNNING -> {
+                    queue.push(message, task.backoffPeriod(taskModel, stage))
+                    trackResult(stage, thisInvocationStartTimeMs, taskModel, result.status)
+                  }
+                  SUCCEEDED, REDIRECT, SKIPPED, FAILED_CONTINUE, STOPPED -> {
+                    queue.push(CompleteTask(message, result.status))
+                    trackResult(stage, thisInvocationStartTimeMs, taskModel, result.status)
+                  }
+                  CANCELED -> {
+                    task.onCancel(stage)
+                    val status = stage.failureStatus(default = result.status)
+                    queue.push(CompleteTask(message, status, result.status))
+                    trackResult(stage, thisInvocationStartTimeMs, taskModel, status)
+                  }
+                  TERMINAL -> {
+                    val status = stage.failureStatus(default = result.status)
+                    queue.push(CompleteTask(message, status, result.status))
+                    trackResult(stage, thisInvocationStartTimeMs, taskModel, status)
+                  }
+                  else ->
+                    TODO("Unhandled task status ${result.status}")
                 }
-                SUCCEEDED, REDIRECT, FAILED_CONTINUE, STOPPED -> {
-                  queue.push(CompleteTask(message, result.status))
-                  trackResult(stage, thisInvocationStartTimeMs, taskModel, result.status)
-                }
-                CANCELED                             -> {
-                  task.onCancel(stage)
-                  val status = stage.failureStatus(default = result.status)
-                  queue.push(CompleteTask(message, status, result.status))
-                  trackResult(stage, thisInvocationStartTimeMs, taskModel, status)
-                }
-                TERMINAL                             -> {
-                  val status = stage.failureStatus(default = result.status)
-                  queue.push(CompleteTask(message, status, result.status))
-                  trackResult(stage, thisInvocationStartTimeMs, taskModel, status)
-                }
-                else                                 ->
-                  TODO("Unhandled task status ${result.status}")
               }
             }
           }
@@ -190,8 +198,12 @@ class RunTaskHandler(
   }
 
   private fun Task.checkForTimeout(stage: Stage, taskModel: com.netflix.spinnaker.orca.pipeline.model.Task, message: Message) {
-    checkForStageTimeout(stage)
-    checkForTaskTimeout(taskModel, stage, message)
+    if (stage.type == RestrictExecutionDuringTimeWindow.TYPE) {
+      return
+    } else {
+      checkForStageTimeout(stage)
+      checkForTaskTimeout(taskModel, stage, message)
+    }
   }
 
   private fun Task.checkForTaskTimeout(taskModel: com.netflix.spinnaker.orca.pipeline.model.Task, stage: Stage, message: Message) {
@@ -210,7 +222,7 @@ class RunTaskHandler(
           val durationString = formatTimeout(elapsedTime.toMillis())
           val msg = StringBuilder("${javaClass.simpleName} of stage ${stage.name} timed out after $durationString. ")
           msg.append("pausedDuration: ${formatTimeout(pausedDuration.toMillis())}, ")
-          msg.append("elapsedTime: ${formatTimeout(elapsedTime.toMillis())},")
+          msg.append("elapsedTime: ${formatTimeout(elapsedTime.toMillis())}, ")
           msg.append("timeoutValue: ${formatTimeout(actualTimeout.toMillis())}")
 
           log.warn(msg.toString())
@@ -288,6 +300,25 @@ class RunTaskHandler(
       context.putAll(result.context)
       outputs.putAll(filteredOutputs)
       repository.storeStage(this)
+    }
+  }
+
+  private fun Stage.withLoggingContext(taskModel: com.netflix.spinnaker.orca.pipeline.model.Task, block: () -> Unit) {
+    try {
+      MDC.put("application", this.execution.application)
+      MDC.put("stageType", type)
+      MDC.put("taskType", taskModel.implementingClass)
+
+      if (taskModel.startTime != null) {
+        MDC.put("taskStartTime", taskModel.startTime.toString())
+      }
+
+      block.invoke()
+    } finally {
+      MDC.remove("stageType")
+      MDC.remove("taskType")
+      MDC.remove("taskStartTime")
+      MDC.remove("application")
     }
   }
 }

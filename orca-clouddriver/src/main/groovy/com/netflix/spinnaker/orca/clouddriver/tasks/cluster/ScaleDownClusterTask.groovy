@@ -16,6 +16,7 @@
 
 package com.netflix.spinnaker.orca.clouddriver.tasks.cluster
 
+import com.netflix.spinnaker.orca.clouddriver.pipeline.cluster.AbstractClusterWideClouddriverOperationStage.ClusterSelection
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.Location
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.TargetServerGroup
 import com.netflix.spinnaker.orca.pipeline.model.Stage
@@ -41,7 +42,17 @@ class ScaleDownClusterTask extends AbstractClusterWideClouddriverTask {
   @Override
   protected Map buildOperationPayload(Stage stage, TargetServerGroup serverGroup) {
     ClusterSelection clusterSelection = stage.mapTo(ClusterSelection)
-    return super.buildOperationPayload(stage, serverGroup) + [capacity: [min: 0, max: 0, desired: 0]]
+    Map resizeOp = [capacity: [min: 0, max: 0, desired: 0]]
+    if (clusterSelection.cloudProvider == 'gce' && serverGroup.getAutoscalingPolicy()) {
+      resizeOp.autoscalingMode = 'ONLY_DOWN'
+
+      // Avoid overriding persisted autoscaling policy metadata to 0/0/0 and mode = ONLY_DOWN.
+      // This ensures the server group will be scaled properly with the previously persisted
+      // autoscaling policy if re-enabled.
+      resizeOp.writeMetadata = false
+    }
+
+    return super.buildOperationPayload(stage, serverGroup) + resizeOp
   }
 
   @Override
@@ -53,6 +64,7 @@ class ScaleDownClusterTask extends AbstractClusterWideClouddriverTask {
         processes: ['Terminate']
       ]]
     }
+
     ops + super.buildOperationPayloads(stage, serverGroup)
   }
 

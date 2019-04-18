@@ -43,7 +43,7 @@ class DependentPipelineStarterSpec extends Specification {
 
   ObjectMapper mapper = OrcaObjectMapper.newInstance()
   ExecutionRepository executionRepository = Mock(ExecutionRepository)
-  ArtifactResolver artifactResolver = Spy(ArtifactResolver, constructorArgs: [mapper, executionRepository])
+  ArtifactResolver artifactResolver = Spy(ArtifactResolver, constructorArgs: [mapper, executionRepository, new ContextParameterProcessor()])
 
   def "should only propagate credentials when explicitly provided"() {
     setup:
@@ -406,5 +406,47 @@ class DependentPipelineStarterSpec extends Specification {
     authenticatedUser.setAllowedAccounts(allowedAccounts)
 
     return authenticatedUser
+  }
+
+  def "should resolve expressions in trigger using the context of the trigger"() {
+    given:
+    def triggeredPipelineConfig = [name: "triggered", id: "triggered", parameterConfig: [[name: 'a', default: '${trigger.type}']]]
+    def parentPipeline = pipeline {
+      name = "parent"
+      trigger = new DefaultTrigger("manual", null, "fzlem@netflix.com", [:], [], [], false, true)
+      authentication = new Execution.AuthenticationDetails("parentUser", "acct1", "acct2")
+    }
+    def executionLauncher = Mock(ExecutionLauncher)
+    def applicationContext = new StaticApplicationContext()
+    applicationContext.beanFactory.registerSingleton("pipelineLauncher", executionLauncher)
+    dependentPipelineStarter = new DependentPipelineStarter(
+      applicationContext,
+      mapper,
+      new ContextParameterProcessor(),
+      Optional.of([]),
+      Optional.of(artifactResolver),
+      new NoopRegistry()
+    )
+
+    and:
+    executionLauncher.start(*_) >> {
+      def p = mapper.readValue(it[1], Map)
+      return pipeline {
+        trigger = mapper.convertValue(p.trigger, Trigger)
+      }
+    }
+
+    when:
+    def result = dependentPipelineStarter.trigger(
+      triggeredPipelineConfig,
+      null /*user*/,
+      parentPipeline,
+      [:],
+      null,
+      buildAuthenticatedUser("user", [])
+    )
+
+    then:
+    result.trigger.parameters.a == "pipeline"
   }
 }

@@ -24,10 +24,12 @@ import com.netflix.spinnaker.orca.front50.Front50Service
 import com.netflix.spinnaker.orca.model.OrchestrationViewModel
 import com.netflix.spinnaker.orca.pipeline.ExecutionRunner
 import com.netflix.spinnaker.orca.pipeline.StageDefinitionBuilder
+import com.netflix.spinnaker.orca.pipeline.StageDefinitionBuilderFactory
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType
 import com.netflix.spinnaker.orca.pipeline.model.Stage
 import com.netflix.spinnaker.orca.pipeline.model.Trigger
+import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionNotFoundException
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository
 import com.netflix.spinnaker.orca.pipeline.util.ContextParameterProcessor
 import com.netflix.spinnaker.security.AuthenticatedRequest
@@ -40,17 +42,25 @@ import org.springframework.security.access.prepost.PostAuthorize
 import org.springframework.security.access.prepost.PostFilter
 import org.springframework.security.access.prepost.PreAuthorize
 import org.springframework.security.access.prepost.PreFilter
-import org.springframework.web.bind.annotation.*
+import org.springframework.web.bind.annotation.PathVariable
+import org.springframework.web.bind.annotation.RequestBody
+import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RequestMethod
+import org.springframework.web.bind.annotation.RequestParam
+import org.springframework.web.bind.annotation.ResponseStatus
+import org.springframework.web.bind.annotation.RestController
 import rx.schedulers.Schedulers
 
 import java.nio.charset.Charset
 import java.time.Clock
+import java.time.ZoneOffset
 import java.util.concurrent.TimeUnit
 import java.util.stream.Collectors
 
 import static com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType.ORCHESTRATION
 import static com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType.PIPELINE
-import static java.time.ZoneOffset.UTC
+import static com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.*
+import static com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionComparator.*
 
 @Slf4j
 @RestController
@@ -76,6 +86,9 @@ class TaskController {
   @Autowired
   Registry registry
 
+  @Autowired
+  StageDefinitionBuilderFactory stageDefinitionBuilderFactory
+
   @Value('${tasks.daysOfExecutionHistory:14}')
   int daysOfExecutionHistory
 
@@ -93,29 +106,23 @@ class TaskController {
     @RequestParam(value = "statuses", required = false) String statuses
   ) {
     statuses = statuses ?: ExecutionStatus.values()*.toString().join(",")
-    def executionCriteria = new ExecutionRepository.ExecutionCriteria()
+    def executionCriteria = new ExecutionCriteria()
       .setPage(page)
-      .setLimit(limit)
+      .setPageSize(limit)
       .setStatuses(statuses.split(",") as Collection)
+      .setStartTimeCutoff(
+        clock
+          .instant()
+          .atZone(ZoneOffset.UTC)
+          .minusDays(daysOfExecutionHistory)
+          .toInstant()
+      )
 
-    def startTimeCutoff = clock
-      .instant()
-      .atZone(UTC)
-      .minusDays(daysOfExecutionHistory)
-      .toInstant()
-      .toEpochMilli()
-
-    def orchestrations = executionRepository
-      .retrieveOrchestrationsForApplication(application, executionCriteria)
-      .filter({ Execution orchestration -> !orchestration.startTime || (orchestration.startTime > startTimeCutoff) })
-      .map({ Execution orchestration -> convert(orchestration) })
-      .subscribeOn(Schedulers.io())
-      .toList()
-      .toBlocking()
-      .single()
-      .sort(startTimeOrId)
-
-    orchestrations.subList(0, Math.min(orchestrations.size(), limit))
+    executionRepository.retrieveOrchestrationsForApplication(
+      application,
+      executionCriteria,
+      START_TIME_OR_ID
+    ).collect { convert(it) }
   }
 
   @PreAuthorize("@fiatPermissionEvaluator.storeWholePermission()")
@@ -159,8 +166,7 @@ class TaskController {
   @RequestMapping(value = "/tasks/{id}/cancel", method = RequestMethod.PUT)
   @ResponseStatus(HttpStatus.ACCEPTED)
   void cancelTask(@PathVariable String id) {
-    executionRepository.cancel(ORCHESTRATION, id, AuthenticatedRequest.getSpinnakerUser().orElse("anonymous"), null)
-    executionRepository.updateStatus(ORCHESTRATION, id, ExecutionStatus.CANCELED)
+    cancelExecution(ORCHESTRATION, id)
   }
 
   @PreFilter("hasPermission(this.getOrchestration(filterObject)?.application, 'APPLICATION', 'WRITE')")
@@ -168,28 +174,74 @@ class TaskController {
   @ResponseStatus(HttpStatus.ACCEPTED)
   void cancelTasks(@RequestBody List<String> taskIds) {
     taskIds.each {
-      executionRepository.cancel(ORCHESTRATION, it, AuthenticatedRequest.getSpinnakerUser().orElse("anonymous"), null)
-      executionRepository.updateStatus(ORCHESTRATION, it, ExecutionStatus.CANCELED)
+      cancelExecution(ORCHESTRATION, it)
     }
   }
 
+/**
+ * Retrieves an ad-hoc collection of executions based on a number of user-supplied parameters. Either executionIds or
+ * pipelineConfigIds must be supplied in order to return any results. If both are supplied, an IllegalArgumentException
+ * will be thrown.
+ * @param pipelineConfigIds A comma-separated list of pipeline config ids
+ * @param executionIds A comma-separated list of execution ids; if specified, limit and statuses parameters will be
+ * ignored
+ * @param limit (optional) Number of most recent executions to retrieve per pipeline config; defaults to 1, ignored if
+ * executionIds is specified
+ * @param statuses (optional) Execution statuses to filter results by; defaults to all, ignored if executionIds is
+ * specified
+ * @param expand (optional) Expands each execution object in the resulting list. If this value is missing,
+ * it is defaulted to true.
+ * @return
+ */
+  @PostFilter("hasPermission(filterObject.application, 'APPLICATION', 'READ')")
   @RequestMapping(value = "/pipelines", method = RequestMethod.GET)
-  List<Execution> listLatestPipelines(
-    @RequestParam(value = "pipelineConfigIds") String pipelineConfigIds,
+  List<Execution> listSubsetOfPipelines(
+    @RequestParam(value = "pipelineConfigIds", required = false) String pipelineConfigIds,
+    @RequestParam(value = "executionIds", required = false) String executionIds,
     @RequestParam(value = "limit", required = false) Integer limit,
-    @RequestParam(value = "statuses", required = false) String statuses) {
+    @RequestParam(value = "statuses", required = false) String statuses,
+    @RequestParam(value = "expand", defaultValue = "true") boolean expand) {
     statuses = statuses ?: ExecutionStatus.values()*.toString().join(",")
     limit = limit ?: 1
-    def executionCriteria = new ExecutionRepository.ExecutionCriteria(
-      limit: limit,
+    ExecutionCriteria executionCriteria = new ExecutionCriteria(
+      pageSize: limit,
       statuses: (statuses.split(",") as Collection)
     )
 
-    def ids = pipelineConfigIds.split(',')
+    if (!pipelineConfigIds && !executionIds) {
+      return []
+    }
 
-    def allPipelines = rx.Observable.merge(ids.collect {
+    if (pipelineConfigIds && executionIds) {
+      throw new IllegalArgumentException("Only pipelineConfigIds OR executionIds can be specified")
+    }
+
+    if (executionIds) {
+      List<String> ids = executionIds.split(',')
+
+      List<Execution> executions = rx.Observable.from(ids.collect {
+        try {
+          executionRepository.retrieve(PIPELINE, it)
+        } catch (ExecutionNotFoundException e) {
+          null
+        }
+      }).subscribeOn(Schedulers.io()).toList().toBlocking().single().findAll()
+
+      if (!expand) {
+        unexpandPipelineExecutions(executions)
+      }
+
+      return executions
+    }
+    List<String> ids = pipelineConfigIds.split(',')
+
+    List<Execution> allPipelines = rx.Observable.merge(ids.collect {
       executionRepository.retrievePipelinesForPipelineConfigId(it, executionCriteria)
     }).subscribeOn(Schedulers.io()).toList().toBlocking().single().sort(startTimeOrId)
+
+    if (!expand) {
+      unexpandPipelineExecutions(allPipelines)
+    }
 
     return filterPipelinesByHistoryCutoff(allPipelines, limit)
   }
@@ -261,27 +313,52 @@ class TaskController {
   ) {
     validateSearchForPipelinesByTriggerParameters(triggerTimeStartBoundary, triggerTimeEndBoundary, startIndex, size)
 
-    final Map triggerParams = decodeTriggerParams(encodedTriggerParams) // Returned map will be empty if encodedTriggerParams is null
+    ExecutionComparator sortType = BUILD_TIME_DESC
+    if (reverse) {
+      sortType = BUILD_TIME_ASC
+    }
 
-    Set<String> triggerTypesAsSet = (triggerTypes && triggerTypes != "*") ? triggerTypes.split(",") as Set : null // null means all trigger types
-    Set<String> statusesAsSet = (statuses && statuses != "*") ? statuses.split(",") as Set : null // null means all statuses
+    // Returned map will be empty if encodedTriggerParams is null
+    final Map triggerParams = decodeTriggerParams(encodedTriggerParams)
 
-    // Filter by application
-    List<String> pipelineConfigIds = application == "*" ? getPipelineConfigIdsOfReadableApplications() : front50Service.getPipelines(application, false)*.id as List<String>
+    Set<String> triggerTypesAsSet = (triggerTypes && triggerTypes != "*")
+      ? triggerTypes.split(",") as Set
+      : null // null means all trigger types
 
-    List<Execution> pipelineExecutions = executionRepository.retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(pipelineConfigIds, triggerTimeStartBoundary, triggerTimeEndBoundary)
-      .subscribeOn(Schedulers.io())
-      .filter{
-        // Filter by pipeline name
-        if (pipelineName && pipelineName != it.name) {
-          return false
+    // Filter by application (and pipeline name, if that parameter has been given in addition to application name)
+    List<String> pipelineConfigIds
+    if (application == "*") {
+      pipelineConfigIds = getPipelineConfigIdsOfReadableApplications()
+    } else {
+      List<Map<String, Object>> pipelines = front50Service.getPipelines(application, false)
+      pipelines = pipelines.stream().filter({ pipeline ->
+        if (pipelineName != null && pipelineName != "") {
+          return pipeline.get("name") == pipelineName
+        } else {
+          return true
         }
+      }).collect(Collectors.toList())
+      pipelineConfigIds = pipelines*.id as List<String>
+    }
+
+    ExecutionCriteria executionCriteria =  new ExecutionCriteria()
+      .setSortType( sortType )
+    if (statuses != null && statuses != "") {
+      executionCriteria.setStatuses(statuses.split(",").toList())
+    }
+
+    List<Execution> allExecutions = executionRepository.retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+      pipelineConfigIds,
+      triggerTimeStartBoundary,
+      triggerTimeEndBoundary,
+      executionCriteria
+    )
+
+    List<Execution> matchingExecutions = allExecutions
+      .stream()
+      .filter({
         // Filter by trigger type
         if (triggerTypesAsSet && !triggerTypesAsSet.contains(it.getTrigger().type)) {
-          return false
-        }
-        // Filter by statuses
-        if (statusesAsSet && !statusesAsSet.contains(it.getStatus().toString())) {
           return false
         }
         // Filter by event ID
@@ -290,21 +367,14 @@ class TaskController {
         }
         // Filter by trigger params
         return compareTriggerWithTriggerSubset(it.getTrigger(), triggerParams)
-      }
-      .toList()
-      .toBlocking()
-      .single()
-      .sort(reverseBuildTime)
-
-    if (reverse) {
-      pipelineExecutions.reverse(true)
-    }
+      })
+      .collect(Collectors.toList())
 
     List<Execution> rval
-    if (startIndex >= pipelineExecutions.size()) {
+    if (startIndex >= matchingExecutions.size()) {
       rval = []
     } else {
-      rval = pipelineExecutions.subList(startIndex, Math.min(pipelineExecutions.size(), startIndex + size))
+      rval = matchingExecutions.subList(startIndex, Math.min(matchingExecutions.size(), startIndex + size))
     }
 
     if (!expand) {
@@ -351,14 +421,7 @@ class TaskController {
   void cancel(
     @PathVariable String id, @RequestParam(required = false) String reason,
     @RequestParam(defaultValue = "false") boolean force) {
-    executionRepository.retrieve(PIPELINE, id).with { pipeline ->
-      executionRunner.cancel(
-        pipeline,
-        AuthenticatedRequest.getSpinnakerUser().orElse("anonymous"),
-        reason
-      )
-    }
-    executionRepository.updateStatus(PIPELINE, id, ExecutionStatus.CANCELED)
+    cancelExecution(PIPELINE, id, reason)
   }
 
   @PreAuthorize("hasPermission(this.getPipeline(#id)?.application, 'APPLICATION', 'WRITE')")
@@ -404,6 +467,7 @@ class TaskController {
     def stage = pipeline.stages.find { it.id == stageId }
     if (stage) {
       stage.context.putAll(context)
+      validateStageUpdate(stage)
 
       stage.lastModified = new Stage.LastModifiedDetails(
         user: AuthenticatedRequest.getSpinnakerUser().orElse("anonymous"),
@@ -421,6 +485,14 @@ class TaskController {
     pipeline
   }
 
+  // If other execution mutations need validation, factor this out.
+  void validateStageUpdate(Stage stage) {
+    if (stage.context.manualSkip
+        && !stageDefinitionBuilderFactory.builderFor(stage)?.canManuallySkip()) {
+      throw new CannotUpdateExecutionStage("Cannot manually skip stage.")
+    }
+  }
+
   @PreAuthorize("hasPermission(this.getPipeline(#id)?.application, 'APPLICATION', 'WRITE')")
   @RequestMapping(value = "/pipelines/{id}/stages/{stageId}/restart", method = RequestMethod.PUT)
   Execution retryPipelineStage(
@@ -436,9 +508,14 @@ class TaskController {
                                      @RequestParam("expression")
                                        String expression) {
     def execution = executionRepository.retrieve(PIPELINE, id)
+    def context = [
+      execution: execution,
+      trigger: mapper.convertValue(execution.trigger, Map.class)
+    ]
+
     def evaluated = contextParameterProcessor.process(
       [expression: expression],
-      [execution: execution],
+      context,
       true
     )
     return [result: evaluated?.expression, detail: evaluated?.expressionEvaluationSummary]
@@ -472,8 +549,8 @@ class TaskController {
     }
 
     statuses = statuses ?: ExecutionStatus.values()*.toString().join(",")
-    def executionCriteria = new ExecutionRepository.ExecutionCriteria(
-      limit: limit,
+    def executionCriteria = new ExecutionCriteria(
+      pageSize: limit,
       statuses: (statuses.split(",") as Collection)
     )
 
@@ -490,6 +567,21 @@ class TaskController {
     }
 
     return filterPipelinesByHistoryCutoff(allPipelines, limit)
+  }
+
+  private void cancelExecution(ExecutionType executionType, String id) {
+    cancelExecution(executionType, id, null)
+  }
+
+  private void cancelExecution(ExecutionType executionType, String id, String reason) {
+    executionRepository.retrieve(executionType, id).with { execution ->
+      executionRunner.cancel(
+              execution,
+              AuthenticatedRequest.getSpinnakerUser().orElse("anonymous"),
+              reason
+      )
+    }
+    executionRepository.updateStatus(executionType, id, ExecutionStatus.CANCELED)
   }
 
   private static void validateSearchForPipelinesByTriggerParameters(long triggerTimeStartBoundary, long triggerTimeEndBoundary, int startIndex, int size) {
@@ -721,4 +813,8 @@ class TaskController {
       super("Cannot delete a running $type, please cancel it first.")
     }
   }
+
+  @InheritConstructors
+  @ResponseStatus(HttpStatus.METHOD_NOT_ALLOWED)
+  private static class CannotUpdateExecutionStage extends RuntimeException {}
 }

@@ -85,6 +85,18 @@ class TargetServerGroup {
     return serverGroup?.moniker ? objectMapper.convertValue(serverGroup?.moniker, Moniker) : null
   }
 
+  String getCloudProvider() {
+    serverGroup.cloudProvider ?: serverGroup.type
+  }
+
+  /**
+   * Used in UpsertGceAutoscalingPolicy, which is Java, which doesn't play nice with @Delegate
+   * @return
+   */
+  Map<String, Object> getAutoscalingPolicy() {
+    return (Map<String, Object>) serverGroup.autoscalingPolicy
+  }
+
   Map toClouddriverOperationPayload(String account) {
     //TODO(cfieber) - add an endpoint on Clouddriver to do provider appropriate conversion of a TargetServerGroup
     def op = [
@@ -157,7 +169,7 @@ class TargetServerGroup {
     static Location locationFromStageData(StageData stageData) {
       try {
         List zones = stageData.availabilityZones?.values()?.flatten()?.toArray()
-        return resolveLocation(stageData.namespace, stageData.region, zones?.get(0))
+        return resolveLocation(stageData.namespace, stageData.region, zones?.getAt(0))
       } catch (e) {
         throw new IllegalArgumentException("Incorrect location specified for ${stageData}: ${e.message}")
       }

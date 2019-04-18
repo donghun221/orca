@@ -363,12 +363,16 @@ public class Stage implements Serializable {
    * Gets all ancestor stages, including the current stage.
    */
   public List<Stage> ancestors() {
-    Set<String> visited = Sets.newHashSetWithExpectedSize(execution.getStages().size());
-    return ImmutableList
-      .<Stage>builder()
-      .add(this)
-      .addAll(ancestorsOnly(visited))
-      .build();
+    if (execution != null) {
+      Set<String> visited = Sets.newHashSetWithExpectedSize(execution.getStages().size());
+      return ImmutableList
+        .<Stage>builder()
+        .add(this)
+        .addAll(ancestorsOnly(visited))
+        .build();
+    } else {
+      return emptyList();
+    }
   }
 
   private List<Stage> ancestorsOnly(Set<String> visited) {
@@ -416,6 +420,40 @@ public class Stage implements Serializable {
     } else {
       return emptyList();
     }
+  }
+
+  /**
+   * Recursively get all stages that are children of the current one
+   */
+  public List<Stage> allDownstreamStages() {
+    List<Stage> children = new ArrayList<>();
+
+    if (execution != null) {
+      HashSet<String> visited = new HashSet<>();
+      LinkedList<Stage> queue = new LinkedList<>();
+
+      queue.push(this);
+      boolean first = true;
+
+      while (!queue.isEmpty()) {
+        Stage stage = queue.pop();
+        if (!first) {
+          children.add(stage);
+        }
+
+        first = false;
+        visited.add(stage.refId);
+
+        List<Stage> childStages = stage.downstreamStages();
+
+        childStages
+          .stream()
+          .filter(s -> !visited.contains(s.refId))
+          .forEach(s -> queue.add(s));
+      }
+    }
+
+    return children;
   }
 
   /**

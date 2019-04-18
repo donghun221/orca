@@ -16,6 +16,7 @@
 
 package com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup
 
+import com.netflix.spinnaker.kork.dynamicconfig.DynamicConfigService
 import com.netflix.spinnaker.orca.ExecutionStatus
 import com.netflix.spinnaker.orca.kato.pipeline.strategy.Strategy
 
@@ -37,6 +38,7 @@ import com.netflix.spinnaker.orca.pipeline.model.Stage
 import groovy.util.logging.Slf4j
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Component
+
 import static java.util.concurrent.TimeUnit.MINUTES
 
 @Slf4j
@@ -50,6 +52,12 @@ class CreateServerGroupStage extends AbstractDeployStrategyStage {
   @Autowired
   private RollbackClusterStage rollbackClusterStage
 
+  @Autowired
+  private DestroyServerGroupStage destroyServerGroupStage
+
+  @Autowired
+  private DynamicConfigService dynamicConfigService
+
   CreateServerGroupStage() {
     super(PIPELINE_CONFIG_TYPE)
   }
@@ -60,31 +68,39 @@ class CreateServerGroupStage extends AbstractDeployStrategyStage {
 
     def tasks = [
       TaskNode.task("createServerGroup", CreateServerGroupTask),
-      TaskNode.task("monitorDeploy", MonitorKatoTask),
-      TaskNode.task("forceCacheRefresh", ServerGroupCacheForceRefreshTask),
+      TaskNode.task("monitorDeploy", MonitorKatoTask)
     ]
+
+    if (isForceCacheRefreshEnabled(dynamicConfigService)) {
+      tasks << TaskNode.task("forceCacheRefresh", ServerGroupCacheForceRefreshTask)
+    }
 
     if (taggingEnabled) {
       tasks << TaskNode.task("tagServerGroup", AddServerGroupEntityTagsTask)
     }
 
     tasks << TaskNode.task("waitForUpInstances", WaitForUpInstancesTask)
-    tasks << TaskNode.task("forceCacheRefresh", ServerGroupCacheForceRefreshTask)
+
+    if (isForceCacheRefreshEnabled(dynamicConfigService)) {
+      tasks << TaskNode.task("forceCacheRefresh", ServerGroupCacheForceRefreshTask)
+    }
 
     return tasks
   }
 
   @Override
   void onFailureStages(@Nonnull Stage stage, StageGraphBuilder graph) {
-    super.onFailureStages(stage, graph)
-
     def stageData = stage.mapTo(StageData)
     if (!stageData.rollback?.onFailure) {
+      super.onFailureStages(stage, graph)
+
       // rollback on failure is not enabled
       return
     }
 
     if (!stageData.getServerGroup()) {
+      super.onFailureStages(stage, graph)
+
       // did not get far enough to create a new server group
       log.warn("No server group was created, skipping rollback! (executionId: ${stage.execution.id}, stageId: ${stage.id})")
       return
@@ -119,6 +135,25 @@ class CreateServerGroupStage extends AbstractDeployStrategyStage {
         ]
       }
     }
+
+    if (stageData.rollback?.destroyLatest) {
+      graph.add {
+        it.type = destroyServerGroupStage.type
+        it.name = "Destroy ${stageData.serverGroup}"
+        it.context = [
+          "cloudProvider"     : stageData.cloudProvider,
+          "cloudProviderType" : stageData.cloudProvider,
+          "cluster"           : stageData.cluster,
+          "credentials"       : stageData.credentials,
+          "region"            : stageData.region,
+          "serverGroupName"   : stageData.serverGroup,
+          "stageTimeoutMs"    : MINUTES.toMillis(5) // timebox a destroy to 5 minutes
+        ]
+      }
+    }
+
+    // any on-failure stages from the parent should be executed _after_ the rollback completes
+    super.onFailureStages(stage, graph)
   }
 
   private static class StageData {
@@ -153,5 +188,6 @@ class CreateServerGroupStage extends AbstractDeployStrategyStage {
 
   private static class Rollback {
     Boolean onFailure
+    Boolean destroyLatest
   }
 }

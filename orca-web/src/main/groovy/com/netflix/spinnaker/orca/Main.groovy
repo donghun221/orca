@@ -24,6 +24,8 @@ import com.netflix.spinnaker.kork.PlatformComponents
 import com.netflix.spinnaker.orca.applications.config.ApplicationConfig
 import com.netflix.spinnaker.orca.bakery.config.BakeryConfiguration
 import com.netflix.spinnaker.orca.clouddriver.config.CloudDriverConfiguration
+import com.netflix.spinnaker.orca.clouddriver.config.ClouddriverJobConfiguration
+import com.netflix.spinnaker.orca.config.GremlinConfiguration
 import com.netflix.spinnaker.orca.config.KeelConfiguration
 import com.netflix.spinnaker.orca.config.OrcaConfiguration
 import com.netflix.spinnaker.orca.config.PipelineTemplateConfiguration
@@ -40,6 +42,7 @@ import com.netflix.spinnaker.orca.webhook.config.WebhookConfiguration
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration
 import org.springframework.boot.autoconfigure.batch.BatchAutoConfiguration
 import org.springframework.boot.autoconfigure.groovy.template.GroovyTemplateAutoConfiguration
+import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
 import org.springframework.boot.builder.SpringApplicationBuilder
 import org.springframework.boot.web.support.SpringBootServletInitializer
 import org.springframework.context.annotation.ComponentScan
@@ -49,7 +52,11 @@ import org.springframework.scheduling.annotation.EnableAsync
 
 @Configuration
 @EnableAsync
-@EnableAutoConfiguration(exclude = [BatchAutoConfiguration, GroovyTemplateAutoConfiguration])
+@EnableAutoConfiguration(exclude = [
+  BatchAutoConfiguration,
+  GroovyTemplateAutoConfiguration,
+  DataSourceAutoConfiguration
+])
 @Import([
   PlatformComponents,
   WebConfiguration,
@@ -61,6 +68,7 @@ import org.springframework.scheduling.annotation.EnableAsync
   Front50Configuration,
   FlexConfiguration,
   CloudDriverConfiguration,
+  ClouddriverJobConfiguration,
   IgorConfiguration,
   DiscoveryPollingConfiguration,
   TomcatConfiguration,
@@ -71,7 +79,8 @@ import org.springframework.scheduling.annotation.EnableAsync
   KayentaConfiguration,
   WebhookConfiguration,
   KeelConfiguration,
-  QosConfiguration
+  QosConfiguration,
+  GremlinConfiguration
 ])
 @ComponentScan([
   "com.netflix.spinnaker.config"
